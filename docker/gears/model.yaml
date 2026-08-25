@@ -1,0 +1,36 @@
+# GEARS-ct run recipe — the single source of truth for how the GEARS container is
+# trained and run. Read lazily by benchmark.predictors.container_predictor.GEARSContainer
+# (via ContainerPredictor._recipe). Benchmark *capabilities* (scenarios, cell_aware,
+# has_drop_rule) are declared in Python on the predictor class, NOT here — verify
+# reads those in a pyyaml-less env. See docker/CONTRACT.md.
+
+model_key: gears                                    # config `model` field + registry key in the container
+sif_path: docker/gears/gears.sif                    # repo-relative; resolved via the customapps symlink
+entry: [python, /app_code/gears/run_model.py]       # argv run via `singularity exec`
+code_binds:                                          # host dir -> in-container mount (env-only sif; code bind-mounted)
+  docker/gears: /app_code/gears                      # wrapper inlines its data-load shim → no separate harness bind
+gene2go_path: /app_code/gears/gene2go_all.pkl        # in-container path (bind-mounted); injected into config.json
+wandb_project: vcr-gears-ct                          # self-hosted W&B (train only; endpoint via WANDB_* env)
+
+# Hyperparameters — the GEARS AUTHORS' recommended values (the vendored GEARS
+# class's own model_initialize()/train() defaults, mirroring snap-stanford/GEARS).
+# The atheus reference config matched these EXACTLY except it halved training to
+# epochs=10; we restore the author-recommended epochs=20. Do not tune toward a
+# target. (`use_direction_loss` dropped — the wrapper never reads it.)
+hyperparameters:
+  use_mse_loss: false           # false => GEARS' native direction-aware autofocus loss
+  hidden_size: 64
+  num_go_gnn_layers: 1
+  num_gene_gnn_layers: 1
+  decoder_hidden_size: 16
+  epochs: 20                    # author default (atheus had halved it to 10)
+  lr: 0.001
+  weight_decay: 0.0005
+  batch_size: 32
+  test_batch_size: 128          # author default (eval batching only — no effect on the trained model)
+  coexpress_threshold: 0.4
+  num_similar_genes_go_graph: 20
+  num_similar_genes_co_express_graph: 20
+  uncertainty: false
+  uncertainty_reg: 1.0
+  direction_lambda: 0.1
