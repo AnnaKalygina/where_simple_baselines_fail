@@ -1,0 +1,29 @@
+# Conda environment for PREPROCESSING + the fast/structural verifier (no torch).
+#
+# Used by: data/{dataset}/get_data.py and
+#   `python -m benchmark.verify --fast` / `--contracts` / `run_pipeline verify`.
+# Versions are pinned to the working `preprocess` env (captured 2026-06-16).
+#
+#   conda env create -f environment-preprocess.yml      # creates env `preprocess`
+#   conda run -n preprocess python -m benchmark.verify --fast
+name: preprocess
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.10.20
+  - numpy=2.2.6
+  - scipy=1.15.3
+  - pandas=2.3.3
+  - scikit-learn=1.7.2
+  - h5py
+  - pyarrow            # parquet reading (xatlas_orion)
+  - scikit-misc        # loess backend REQUIRED by scanpy's seurat_v3 HVG flavor
+  - pytest             # unit-test tier (tests/)
+  - pip
+  - pip:
+      - anndata==0.11.4
+      - scanpy==1.11.5
+      # Differential expression (ArcInstitute/pdex — the engine behind cell-eval).
+      # Pinned: 0.1.28 is the last release supporting python 3.10; >=0.2.0 needs 3.11.
+      - pdex==0.1.28
