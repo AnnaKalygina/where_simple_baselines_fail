@@ -38,9 +38,12 @@ models/presage_standalone/**/
 # Empty staging dir
 models/atheus_csb_staging/
 
-# Per-dataset prediction/weight artifacts (predictions.npz + weights.npz under
-# models/{dataset}/_panel_{union,miller_align}/...) — large & regenerable via
-# run_pipeline; keep only source/docs (README.md, MANIFEST.json) under models/
+# Per-(dataset, predictor, scenario, fold) run artifacts — predictions.npz,
+# weights.npz, checkpoint/, metrics json/csv/ckpt. Large & regenerable via
+# run_pipeline. Ignored at the RUN-DIR level: git does not descend into an
+# ignored directory, so any !negation must sit ABOVE this subtree.
+models/*/*/*/*/
+# Legacy gene-panel tree (pre single-panel rebuild)
 models/*/_panel_*/
 
 # Stray backups under models/ (e.g. MANIFEST.json.bak, .bak2, .bak3)
@@ -55,7 +58,8 @@ figures/
 logs/
 # Figure-generation scripts are local/scratch tooling (not version-controlled)
 plotting/
-slurm/figure_*
+# SLURM job scripts — local operational tooling, not version-controlled
+slurm/
 
 # === Python ===
 __pycache__/
@@ -70,3 +74,7 @@ __pycache__/
 
 # === Container images ===
 *.sif
+
+# === Notes / planning docs ===
+# Design notes and plans stay local — the repo carries code, not notes.
+*.md
