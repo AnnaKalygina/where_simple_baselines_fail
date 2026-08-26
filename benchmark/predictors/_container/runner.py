@@ -103,7 +103,11 @@ def run_container(sif, mode: str, config: dict, data_dir, output_dir, *,
     if cfg.get("output_path"):
         cfg["output_path"] = f"{C_OUTPUT}/{Path(cfg['output_path']).name}"
 
-    config_path = output_dir / "config.json"
+    # Per-mode filename: both modes used to write `config.json` into the same run
+    # dir, so a predict run silently overwrote the record of how training was
+    # configured. The in-container path is unchanged (bound to /config.json), so
+    # this is host-side only and no wrapper needs to change.
+    config_path = output_dir / f"{mode}_config.json"
     config_path.write_text(json.dumps(cfg, indent=2))
 
     cmd = build_command(sif, mode, config_path, data_dir, output_dir,

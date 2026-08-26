@@ -47,6 +47,7 @@ from benchmark.meta_metrics import (
 from benchmark.predictors.base import (
     PREDICTOR_REGISTRY, get_predictor, _ensure_predictors_loaded, predictor_category)
 from benchmark.predictors.learned import LearnedPredictor
+from benchmark.predictors.trained import TrainedPredictor
 
 log = logging.getLogger(__name__)
 
@@ -321,7 +322,12 @@ def cmd_fit(args) -> None:
                 continue
             log.info("FIT %s/%s/fold%d %s", ds, sc, fold, p)
             try:
-                model.fit(store, sc, fold)
+                # Only the expensive tier has anything to force: it is what holds
+                # a run claim and wipes a run dir before retraining.
+                if isinstance(model, TrainedPredictor):
+                    model.fit(store, sc, fold, force=getattr(args, "force", False))
+                else:
+                    model.fit(store, sc, fold)
             except FileNotFoundError as e:
                 # DL adapters raise this when MANIFEST lacks an entry for this
                 # (dataset, scenario, fold). Soft-skip rather than abort.

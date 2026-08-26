@@ -60,6 +60,19 @@ def normalize_combo_label(c: str) -> str:
     return "+".join(sorted(genes))
 
 
+def _assert_unique(names, what: str) -> None:
+    """Gene axes are used as dict keys; duplicates must not pass silently."""
+    seen, dupes = set(), []
+    for n in names:
+        if n in seen and len(dupes) < 5:
+            dupes.append(str(n))
+        seen.add(n)
+    if dupes:
+        raise ValueError(
+            f"{what}: duplicate gene name(s) {dupes} — a name-keyed axis cannot "
+            f"be built from a non-unique index without silently losing genes")
+
+
 def map_predictions_to_delta_tensor(adata, store, scenario: str, fold: int, *,
                                     model_name: str = "container") -> np.ndarray:
     """Reduce a container's ``predictions.h5ad`` (``adata``) to the benchmark's
@@ -75,6 +88,11 @@ def map_predictions_to_delta_tensor(adata, store, scenario: str, fold: int, *,
 
     # --- gene intersection (by symbol); model genes not in the store are dropped,
     #     store genes the model doesn't predict stay NaN. ---
+    # Duplicate names would collapse to the LAST index here, silently dropping a
+    # gene from the mapping and mis-attributing its prediction. Cheap to assert,
+    # impossible to notice downstream.
+    _assert_unique(adata.var_names, f"{model_name} predictions.h5ad var_names")
+    _assert_unique(store.gene_names, f"{store.dataset} store.gene_names")
     model_to_idx = {g: i for i, g in enumerate(adata.var_names)}
     store_gene_to_idx = {g: i for i, g in enumerate(store.gene_names)}
     common = [(m, store_gene_to_idx[g]) for g, m in model_to_idx.items()

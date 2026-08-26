@@ -35,7 +35,8 @@ import numpy as np
 from benchmark.config import (
     h5ad_path, split_obs_column, predictor_dir, checkpoint_dir, parse_target_genes)
 from benchmark.data_loader import DatasetStore
-from benchmark.predictors.base import Predictor, register
+from benchmark.predictors.base import register
+from benchmark.predictors.trained import TrainedPredictor
 # Host-side glue for container predictors (moved out of docker/harness/ into this
 # package — imported normally, no sys.path shim). None of these import yaml at
 # module top, so importing this predictor stays safe in the pyyaml-less env.
@@ -56,7 +57,7 @@ COVARIATE_COLUMN = _config.COVARIATE_COLUMN
 # ===================================================================
 
 
-class ContainerPredictor(Predictor):
+class ContainerPredictor(TrainedPredictor):
     """Base for models trained in a vendored ``.sif`` on our leak-safe splits.
 
     A subclass declares its benchmark *capabilities* as plain class attributes —
@@ -73,10 +74,6 @@ class ContainerPredictor(Predictor):
     is_container_trained = True  # logic runs in the .sif → exempt from the L4 synthetic-contract meta-check
     # subclass-provided capability declaration (plain Python, read by verify):
     model_dir: str = ""          # repo-relative dir holding this model's model.yaml
-    cell_aware: bool = False
-    seed: int = 42
-    train_timeout: Optional[int] = None
-    predict_timeout: Optional[int] = None
 
     # -------- run recipe (lazy; from docker/<model>/model.yaml) --------
 
@@ -101,6 +98,7 @@ class ContainerPredictor(Predictor):
         if not path.exists():
             raise FileNotFoundError(f"{cls.name}: model recipe not found at {path}")
         recipe = yaml.safe_load(path.read_text())
+        _validate_recipe(recipe, f"{cls.name} ({path})")
         cls._recipe_cache = recipe
         return recipe
 
@@ -129,6 +127,16 @@ class ContainerPredictor(Predictor):
         return self._recipe()["model_key"]
 
     @property
+    def train_timeout(self) -> int:
+        """Seconds before a hung training run is killed. Required in the recipe:
+        without it a wedged container holds the GPU until SLURM reaps the job."""
+        return int(self._recipe()["train_timeout"])
+
+    @property
+    def predict_timeout(self) -> int:
+        return int(self._recipe()["predict_timeout"])
+
+    @property
     def extra_config(self) -> Dict:
         """Model-specific keys injected into the container ``config.json``."""
         recipe = self._recipe()
@@ -152,27 +160,12 @@ class ContainerPredictor(Predictor):
         """Resolve repo-relative code bind sources to absolute host paths."""
         return {str(REPO_ROOT / src): dest for src, dest in self.code_binds.items()}
 
-    def _run_dir(self, store: DatasetStore, scenario: str, fold: int) -> Path:
-        """This fold's checkpoint dir — written by fit, read by predict.
-
-        Delegates to ``config.checkpoint_dir`` so the path is defined in exactly
-        one place; the scored ``predictions.npz`` always stays under
-        ``predictor_dir`` via the inherited ``save_predictions``.
-        """
-        return checkpoint_dir(store.dataset, self.name, scenario, fold)
-
     def _data_dir(self, store: DatasetStore) -> Path:
         return Path(h5ad_path(store.dataset)).parent
 
     # -------- gates --------
 
-    def _check_scenario(self, scenario: str) -> None:
-        if scenario not in self.scenarios:
-            raise ValueError(
-                f"{self.name} does not support scenario {scenario!r} "
-                f"(supports {self.scenarios})")
-
-    def _leakage_gate(self, store: DatasetStore, scenario: str, fold: int) -> dict:
+    def _leakage_gate(self, store: DatasetStore, scenario: str, fold: int) -> None:
         report = leakage.assert_leak_safe_columns(
             h5ad_path(store.dataset), split_obs_column(scenario, fold),
             regime=scenario, covariate_col=COVARIATE_COLUMN)
@@ -183,7 +176,6 @@ class ContainerPredictor(Predictor):
         log.info("%s leakage gate OK (%s mode, %d test units, 0 leaked) — %s/%s/fold%d",
                  self.name, report["mode"], report["n_test_units"],
                  store.dataset, scenario, fold)
-        return report
 
     def _preflight(self, store: DatasetStore, scenario: str, fold: int) -> None:
         """Cheap correctness asserts before training (§6 Preflight)."""
@@ -251,69 +243,43 @@ class ContainerPredictor(Predictor):
 
     def _expected_artifacts(self) -> List[str]:
         """Run-dir-relative paths that must ALL exist for the run to count as
-        trained. Declared per model in its ``model.yaml`` (``expected_artifacts``)."""
-        return list(self._recipe().get("expected_artifacts", []))
+        trained. Declared per model in its ``model.yaml``.
 
-    def missing_artifacts(self, store: DatasetStore, scenario: str, fold: int) -> List[str]:
-        """Which expected artefacts are absent from this fold's run dir."""
-        run_dir = self._run_dir(store, scenario, fold)
-        return [rel for rel in self._expected_artifacts() if not (run_dir / rel).exists()]
+        Required, not defaulted: an empty list would make ``missing_artifacts``
+        return nothing, so an EMPTY run dir would report itself trained and
+        ``fit``'s post-condition would pass after a crash.
+        """
+        artifacts = self._recipe()["expected_artifacts"]
+        if not artifacts:
+            raise ValueError(
+                f"{self.name}: model.yaml declares an empty `expected_artifacts` "
+                f"— then nothing distinguishes a trained run from an empty dir")
+        return list(artifacts)
 
-    def _gene_axis_mismatch(
-        self, store: DatasetStore, scenario: str, fold: int,
-    ) -> Optional[str]:
-        """Was the checkpoint trained on a different gene axis than the dataset
-        now has? Returns a reason string, or None if the axes agree.
+    def _recipe_fingerprint(self) -> Dict:
+        """The recipe fields that change what training produces.
 
-        A dataset rebuild that changes the panel silently invalidates every
-        checkpoint trained before it. GEARS does not notice until deep inside
-        ``forward()``, where it dies on a tensor-size mismatch after the graph
-        build — minutes of GPU time to learn the run was doomed."""
-        rel = self._recipe().get("gene_axis_artifact")
-        if not rel:
-            return None
-        path = self._run_dir(store, scenario, fold) / rel
-        if not path.exists():
-            return None                       # already reported as a missing artefact
-        import h5py                           # deferred: keeps the registry env-independent
-        with h5py.File(str(path), "r") as f:
-            raw = f["var/_index"][:]
-        trained = sorted(g.decode() if isinstance(g, bytes) else str(g) for g in raw)
-        current = sorted(store.gene_names)
-        if trained == current:
-            return None
-        return (f"trained on a different gene axis ({len(trained)} genes) than "
-                f"{store.dataset} now has ({len(current)}) — the dataset was "
-                f"rebuilt after this checkpoint; retrain with --force")
+        Everything the container is told to do, minus the plumbing (paths, mounts,
+        the W&B project) which does not alter the model.
+        """
+        recipe = self._recipe()
+        return {"model_key": recipe["model_key"],
+                "hyperparameters": recipe["hyperparameters"],
+                "extra_config": self.extra_config}
 
-    def unusable_reason(
-        self, store: DatasetStore, scenario: str, fold: int,
-    ) -> Optional[str]:
-        """Why this checkpoint cannot be used, or None if it can."""
-        missing = self.missing_artifacts(store, scenario, fold)
-        if missing:
-            return f"missing artefacts {missing}"
-        return self._gene_axis_mismatch(store, scenario, fold)
-
-    def is_trained(self, store: DatasetStore, scenario: str, fold: int) -> bool:
-        """True when the checkpoint is both complete AND still valid for this data.
-
-        Checks the real artefacts (weights AND the processed cache that GEARS'
-        predict path loads-or-raises), not a placeholder file: the old
-        ``weights.npz``-exists gate reported "trained" while the run dir was
-        gone, so ``predict`` either retrained silently or died mid-run."""
-        return self.unusable_reason(store, scenario, fold) is None
-
-    def fit(self, store: DatasetStore, scenario: str, fold: int) -> None:
-        self._check_scenario(scenario)
-        self._preflight(store, scenario, fold)
-        self._leakage_gate(store, scenario, fold)
-
+    def _prepare_run_dir(self, store: DatasetStore, scenario: str, fold: int) -> Path:
+        """Train from a clean dir: GEARS reuses whatever cache it finds, so a
+        stale `processed_data/` would be silently trained against. Only reached
+        when the CLI has decided to (re)train — an already-trained fold is
+        skipped before this point, so a concurrent run's dir is not wiped."""
         run_dir = self._run_dir(store, scenario, fold)
         if run_dir.exists():                          # B4: fresh dir, no stale cache
             shutil.rmtree(run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
 
+    def _train(self, store: DatasetStore, scenario: str, fold: int,
+               run_dir: Path) -> None:
         cfg = _config.build_config(
             "train", dataset=store.dataset, scenario=scenario, fold=fold,
             model_name=self.model_yaml_key, seed=self.seed,
@@ -331,22 +297,8 @@ class ContainerPredictor(Predictor):
             output_dir=run_dir, code_binds=self._code_binds(), entry=self.entry,
             timeout=self.train_timeout)
 
-        missing = self.missing_artifacts(store, scenario, fold)   # B3
-        if missing:
-            raise RuntimeError(
-                f"{self.name}: training finished but left an unusable run dir at "
-                f"{run_dir} — missing {missing}. Failing here rather than at predict, "
-                f"where the cause would be far from the crash.")
-
-    def predict(self, store: DatasetStore, scenario: str, fold: int) -> np.ndarray:
-        self._check_scenario(scenario)
-        run_dir = self._run_dir(store, scenario, fold)
-        reason = self.unusable_reason(store, scenario, fold)       # B3
-        if reason:
-            raise RuntimeError(
-                f"{self.name}: no usable trained model at {run_dir} — {reason}. "
-                f"Run `fit` (or `all`) first; predict never trains.")
-
+    def _infer(self, store: DatasetStore, scenario: str, fold: int,
+               run_dir: Path) -> np.ndarray:
         preds_h5ad = run_dir / "predictions.h5ad"
         if preds_h5ad.exists():
             preds_h5ad.unlink()
@@ -366,13 +318,10 @@ class ContainerPredictor(Predictor):
         if not preds_h5ad.exists():
             raise RuntimeError(f"{self.name}: predict wrote no {preds_h5ad}")
 
-        deltas = tensor_map.load_and_map(
+        # `load_and_map` places the container's output onto the store's canonical
+        # (bin, ko, gene) axes by NAME; the template then validates the shape.
+        return tensor_map.load_and_map(
             preds_h5ad, store, scenario, fold, model_name=self.name)
-        if not np.isfinite(deltas).any():
-            raise RuntimeError(
-                f"{self.name}: all-NaN delta tensor for {store.dataset}/{scenario}/"
-                f"fold{fold} — condition/covariate mapping mismatch?")
-        return deltas
 
 
 # ===================================================================
@@ -430,3 +379,39 @@ class GEARSContainer(ContainerPredictor):
 
 
 __all__ = ["ContainerPredictor", "GEARSContainer", "COVARIATE_COLUMN"]
+
+
+# ---------------------------------------------------------------------------
+# Recipe schema
+# ---------------------------------------------------------------------------
+
+#: Keys a `model.yaml` MUST declare.
+_REQUIRED_RECIPE_KEYS = frozenset({
+    "model_key", "sif_path", "entry", "code_binds", "hyperparameters",
+    "expected_artifacts", "train_timeout", "predict_timeout",
+})
+#: Keys it MAY declare.
+_OPTIONAL_RECIPE_KEYS = frozenset({"wandb_project", "gene2go_path"})
+
+
+def _validate_recipe(recipe: Dict, where: str) -> None:
+    """Reject a malformed recipe at load time, not mid-run.
+
+    Unknown keys are an ERROR rather than ignored: the recipe is meant to be the
+    single source of truth for how a model is run, and a silently-dropped typo
+    (`epochs` under the wrong nesting, say) would leave that claim false while
+    the model trains with defaults nobody chose.
+    """
+    if not isinstance(recipe, dict):
+        raise ValueError(f"{where}: model.yaml must be a mapping")
+    keys = set(recipe)
+    missing = _REQUIRED_RECIPE_KEYS - keys
+    if missing:
+        raise ValueError(f"{where}: model.yaml is missing required key(s) "
+                         f"{sorted(missing)}")
+    unknown = keys - _REQUIRED_RECIPE_KEYS - _OPTIONAL_RECIPE_KEYS
+    if unknown:
+        raise ValueError(
+            f"{where}: model.yaml has unrecognised key(s) {sorted(unknown)}. "
+            f"Known: {sorted(_REQUIRED_RECIPE_KEYS | _OPTIONAL_RECIPE_KEYS)}. "
+            f"Add it to the schema in container_predictor.py if it is real.")

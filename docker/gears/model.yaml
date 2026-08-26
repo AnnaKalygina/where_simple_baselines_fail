@@ -12,17 +12,17 @@ code_binds:                                          # host dir -> in-container 
 gene2go_path: /app_code/gears/gene2go_all.pkl        # in-container path (bind-mounted); injected into config.json
 wandb_project: vcr-gears-ct                          # self-hosted W&B (train only; endpoint via WANDB_* env)
 
+# Hard ceilings, in seconds. Required: without them a wedged container holds a
+# GPU until SLURM reaps the whole job, and the failure looks like a timeout of
+# the batch script rather than of this model.
+train_timeout: 21600                                 # 6 h (measured: ~68 min on RTX 3090, ~2 h on V100)
+predict_timeout: 3600                                # 1 h (measured: ~11 min)
+
 # Artefacts that must ALL exist for a run dir to count as trained (relative to it).
 # GEARS' predict path LOADS the processed cache and RAISES if it is absent
 # (gears_wrapper._convert_to_gears_format_for_prediction) — it does not rebuild
 # it — so the cache is durable state, not a regenerable scratch dir. Deleting it
 # leaves a checkpoint that can never predict again.
-# The checkpoint artefact whose var index records the GENE AXIS the model was
-# trained on. Compared against the current dataset by is_trained(): a dataset
-# rebuild that changes the panel makes the checkpoint unusable (GEARS crashes deep
-# in forward() with a tensor-size mismatch), so we detect it up front instead.
-gene_axis_artifact: processed_data/cellsimbench_gears/perturb_processed.h5ad
-
 expected_artifacts:
   - model.pt                                              # trained weights
   - config.pkl                                            # GEARS model config (load_pretrained needs both)

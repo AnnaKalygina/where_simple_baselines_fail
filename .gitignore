@@ -71,6 +71,12 @@ wandb/
 # === Notes / planning docs ===
 # Design notes and plans stay local — the repo carries code, not notes.
 *.md
+# ...but interface and build definitions are part of the code: a fresh clone must
+# carry the host<->container contract every wrapper is written against, and the
+# instructions for rebuilding the images.
+!docker/CONTRACT.md
+!docker/**/BUILD_ENV.md
+!README.md
 
 # === Synthetic dataset + depth-hypothesis work (excluded for now) ===
 data/ecoli_synthetic/
