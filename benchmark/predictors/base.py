@@ -73,13 +73,6 @@ class Predictor(ABC):
     # True for predictors with a per-target drop rule (cover < all perts is OK).
     # The verifier derives its coverage invariant from this attribute.
     has_drop_rule: bool = False
-    # True for predictors that ADOPT externally-computed predictions by file
-    # lookup (e.g. the depth_hypothesis transformers) rather than implementing
-    # their logic in-codebase. Like the DL adapters they carry no synthetic L4
-    # contract; the verifier excludes them from the "every non-DL predictor has a
-    # contract" meta-check. Distinct from `model_key` (which ties into the DL
-    # MANIFEST / fold-alignment machinery — adopted predictors have neither).
-    is_adopted: bool = False
     # True for predictors trained + inferred inside an external container (the DL
     # ContainerPredictors, e.g. GEARS-ct): their logic runs in the .sif, not
     # in-codebase, so — like the DL adapters — they carry no synthetic L4 contract
@@ -109,16 +102,25 @@ class Predictor(ABC):
     # Methods with default implementations (override if needed)
     # -----------------------------------------------------------------
 
-    def save_weights(self, path: Path) -> None:
-        """Save learned parameters to `weights.npz`. Default: empty file."""
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(str(path))
+    def is_trained(self, store: DatasetStore, scenario: str, fold: int) -> bool:
+        """Is this predictor's trained state available on disk for this fold?
 
-    @classmethod
-    def load_weights(cls, path: Path) -> "Predictor":
-        """Reconstruct from `weights.npz`. Override for stateful predictors."""
-        return cls()
+        Gates `run_pipeline predict`, which never trains: a predictor that is
+        not trained is skipped with a "run fit first" message.
+
+        Default: analytical baselines and controls carry no trained state, so
+        they are always ready. Tiers that DO persist state override this and
+        validate the artefact they actually need — the learned tier opens its
+        `weights.npz`, container predictors check every file the container must
+        load. A bare `.exists()` on a placeholder file is what made `predict`
+        silently retrain, so it is not enough.
+
+        Persistence itself is deliberately NOT on this base class: it means
+        different things per tier (a small `weights.npz` of coefficients, a
+        multi-GB container run dir, nothing at all), so each tier owns it
+        rather than every predictor stubbing out a method it cannot honour.
+        """
+        return not self.needs_training
 
     def save_predictions(
         self,
@@ -217,17 +219,68 @@ _LOADED = False
 
 
 def _ensure_predictors_loaded() -> None:
+    """Import every predictor module so the `@register` decorators run.
+
+    Discovers modules by walking the package rather than naming them: a
+    hand-kept list silently loses predictors when someone adds a module (and was
+    duplicated in three places, which is how GEARS-ct came to be missing from
+    the `dl` category).
+
+    IMPORT DISCIPLINE (relied on here): a predictor module must import cleanly in
+    EVERY environment that loads the registry — including `preprocess`, which has
+    no pyyaml and no torch. Keep env-specific/heavy imports INSIDE the methods
+    that need them (`ContainerPredictor._recipe` imports yaml lazily; a future
+    TorchPredictor must import torch inside `_train`/`_infer`). Because of that
+    rule an ImportError here is a real bug, not an expected condition, so it is
+    raised rather than swallowed — a silent skip would leave a registry hole that
+    only shows up as "unknown predictor" much later.
+    """
     global _LOADED
     if _LOADED:
         return
-    # Importing these modules triggers the @register decorators.
-    for sub in ("analytical", "learned", "controls", "dl_adapter", "transformers",
-                "container_predictor"):
+    import pkgutil
+    import benchmark.predictors as _pkg
+
+    failures = {}
+    for mod in pkgutil.iter_modules(_pkg.__path__):
+        # `_`-prefixed modules/packages are helpers (`_shared`, `_container`) and
+        # register nothing; `base` is this module.
+        if mod.name.startswith("_") or mod.name == "base":
+            continue
         try:
-            importlib.import_module(f"benchmark.predictors.{sub}")
-        except ImportError as e:
-            log.debug("Predictor submodule %s not importable yet: %s", sub, e)
+            importlib.import_module(f"benchmark.predictors.{mod.name}")
+        except Exception as e:                      # noqa: BLE001 - reported below
+            failures[mod.name] = f"{type(e).__name__}: {e}"
+    if failures:
+        detail = "; ".join(f"{m} ({e})" for m, e in sorted(failures.items()))
+        raise ImportError(
+            f"predictor module(s) failed to import, so the registry is incomplete: "
+            f"{detail}. Heavy/env-specific imports belong inside methods, not at "
+            f"module level (see _ensure_predictors_loaded)."
+        )
     _LOADED = True
+
+
+def predictor_category(cls) -> str:
+    """Grouping used by `--predictor <category>`, DERIVED — never declared.
+
+    Tier first (a container/adapter is `dl`, anything persisting a weights.npz is
+    `learned`), then the defining module for the stateless families that the
+    class hierarchy genuinely does not distinguish: `analytical` and `controls`
+    are both plain stateless `Predictor`s, so only their module separates them.
+
+    Imports are deferred to call time: these modules import `base`, so importing
+    them at module level would be circular.
+    """
+    from benchmark.predictors.learned import LearnedPredictor
+    from benchmark.predictors.container_predictor import ContainerPredictor
+    from benchmark.predictors.dl_adapter import DLAdapter
+
+    if issubclass(cls, (ContainerPredictor, DLAdapter)):
+        return "dl"
+    if issubclass(cls, LearnedPredictor):
+        return "learned"
+    return cls.__module__.rsplit(".", 1)[-1]
 
 
 # ===================================================================

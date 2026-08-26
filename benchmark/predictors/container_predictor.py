@@ -26,14 +26,14 @@ trained"). M3 deletes the adapter and collapses the name.
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
 
-from benchmark.config import h5ad_path, split_obs_column, predictor_dir, parse_target_genes
+from benchmark.config import (
+    h5ad_path, split_obs_column, predictor_dir, checkpoint_dir, parse_target_genes)
 from benchmark.data_loader import DatasetStore
 from benchmark.predictors.base import Predictor, register
 # Host-side glue for container predictors (moved out of docker/harness/ into this
@@ -70,7 +70,6 @@ class ContainerPredictor(Predictor):
     """
 
     needs_training = True
-    is_adopted = False           # trained in-repo — NOT an adopted external prediction
     is_container_trained = True  # logic runs in the .sif → exempt from the L4 synthetic-contract meta-check
     # subclass-provided capability declaration (plain Python, read by verify):
     model_dir: str = ""          # repo-relative dir holding this model's model.yaml
@@ -154,18 +153,13 @@ class ContainerPredictor(Predictor):
         return {str(REPO_ROOT / src): dest for src, dest in self.code_binds.items()}
 
     def _run_dir(self, store: DatasetStore, scenario: str, fold: int) -> Path:
-        """Per-run output/work dir; persisted between fit and predict, fresh per
-        (dataset, scenario, fold).
+        """This fold's checkpoint dir — written by fit, read by predict.
 
-        Heavy/transient artefacts (GEARS ``processed_data/``, checkpoints) can be
-        redirected off the near-full CephFS by setting ``VCR_CONTAINER_MODEL_ROOT``
-        (e.g. to scratch); the scored ``predictions.npz`` always stays under
+        Delegates to ``config.checkpoint_dir`` so the path is defined in exactly
+        one place; the scored ``predictions.npz`` always stays under
         ``predictor_dir`` via the inherited ``save_predictions``.
         """
-        root = os.environ.get("VCR_CONTAINER_MODEL_ROOT")
-        if root:
-            return Path(root) / store.dataset / self.name / scenario / f"fold{fold}"
-        return predictor_dir(store.dataset, self.name, scenario, fold) / "container_model"
+        return checkpoint_dir(store.dataset, self.name, scenario, fold)
 
     def _data_dir(self, store: DatasetStore) -> Path:
         return Path(h5ad_path(store.dataset)).parent
@@ -255,18 +249,60 @@ class ContainerPredictor(Predictor):
 
     # -------- Predictor interface --------
 
-    def save_weights(self, path: Path) -> None:
-        """No-op — a container predictor's trained state is the on-disk container
-        model (``processed_data/`` + checkpoint under ``VCR_CONTAINER_MODEL_ROOT``
-        or the predictor dir), NOT a ``weights.npz``.
+    def _expected_artifacts(self) -> List[str]:
+        """Run-dir-relative paths that must ALL exist for the run to count as
+        trained. Declared per model in its ``model.yaml`` (``expected_artifacts``)."""
+        return list(self._recipe().get("expected_artifacts", []))
 
-        The base default writes an (empty) ``weights.npz``; ``run_pipeline.cmd_predict``
-        then treats ``weights_path.exists()`` as "already trained" and SKIPS ``fit()``
-        on the next predict — which fails the moment the container model isn't
-        colocated with the weights file (e.g. after ``VCR_CONTAINER_MODEL_ROOT`` is
-        redirected or cleaned). Persisting no weights file keeps fit+predict a single
-        unit for container predictors (re-scoring uses ``cmd_metrics`` on the npz)."""
-        pass
+    def missing_artifacts(self, store: DatasetStore, scenario: str, fold: int) -> List[str]:
+        """Which expected artefacts are absent from this fold's run dir."""
+        run_dir = self._run_dir(store, scenario, fold)
+        return [rel for rel in self._expected_artifacts() if not (run_dir / rel).exists()]
+
+    def _gene_axis_mismatch(
+        self, store: DatasetStore, scenario: str, fold: int,
+    ) -> Optional[str]:
+        """Was the checkpoint trained on a different gene axis than the dataset
+        now has? Returns a reason string, or None if the axes agree.
+
+        A dataset rebuild that changes the panel silently invalidates every
+        checkpoint trained before it. GEARS does not notice until deep inside
+        ``forward()``, where it dies on a tensor-size mismatch after the graph
+        build — minutes of GPU time to learn the run was doomed."""
+        rel = self._recipe().get("gene_axis_artifact")
+        if not rel:
+            return None
+        path = self._run_dir(store, scenario, fold) / rel
+        if not path.exists():
+            return None                       # already reported as a missing artefact
+        import h5py                           # deferred: keeps the registry env-independent
+        with h5py.File(str(path), "r") as f:
+            raw = f["var/_index"][:]
+        trained = sorted(g.decode() if isinstance(g, bytes) else str(g) for g in raw)
+        current = sorted(store.gene_names)
+        if trained == current:
+            return None
+        return (f"trained on a different gene axis ({len(trained)} genes) than "
+                f"{store.dataset} now has ({len(current)}) — the dataset was "
+                f"rebuilt after this checkpoint; retrain with --force")
+
+    def unusable_reason(
+        self, store: DatasetStore, scenario: str, fold: int,
+    ) -> Optional[str]:
+        """Why this checkpoint cannot be used, or None if it can."""
+        missing = self.missing_artifacts(store, scenario, fold)
+        if missing:
+            return f"missing artefacts {missing}"
+        return self._gene_axis_mismatch(store, scenario, fold)
+
+    def is_trained(self, store: DatasetStore, scenario: str, fold: int) -> bool:
+        """True when the checkpoint is both complete AND still valid for this data.
+
+        Checks the real artefacts (weights AND the processed cache that GEARS'
+        predict path loads-or-raises), not a placeholder file: the old
+        ``weights.npz``-exists gate reported "trained" while the run dir was
+        gone, so ``predict`` either retrained silently or died mid-run."""
+        return self.unusable_reason(store, scenario, fold) is None
 
     def fit(self, store: DatasetStore, scenario: str, fold: int) -> None:
         self._check_scenario(scenario)
@@ -295,14 +331,21 @@ class ContainerPredictor(Predictor):
             output_dir=run_dir, code_binds=self._code_binds(), entry=self.entry,
             timeout=self.train_timeout)
 
-        if not (run_dir / "processed_data").exists():   # B3
-            raise RuntimeError(f"{self.name}: train produced no processed_data/ in {run_dir}")
+        missing = self.missing_artifacts(store, scenario, fold)   # B3
+        if missing:
+            raise RuntimeError(
+                f"{self.name}: training finished but left an unusable run dir at "
+                f"{run_dir} — missing {missing}. Failing here rather than at predict, "
+                f"where the cause would be far from the crash.")
 
     def predict(self, store: DatasetStore, scenario: str, fold: int) -> np.ndarray:
         self._check_scenario(scenario)
         run_dir = self._run_dir(store, scenario, fold)
-        if not (run_dir / "processed_data").exists():   # B3
-            raise RuntimeError(f"{self.name}: no trained model at {run_dir} — run fit first")
+        reason = self.unusable_reason(store, scenario, fold)       # B3
+        if reason:
+            raise RuntimeError(
+                f"{self.name}: no usable trained model at {run_dir} — {reason}. "
+                f"Run `fit` (or `all`) first; predict never trains.")
 
         preds_h5ad = run_dir / "predictions.h5ad"
         if preds_h5ad.exists():

@@ -28,7 +28,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from benchmark.config import parse_target_genes
+from benchmark.config import parse_target_genes, weights_path
 from benchmark.data_loader import DatasetStore, SplitInfo
 from benchmark.predictors.base import Predictor, register
 from benchmark.predictors._shared import (
@@ -105,8 +105,64 @@ def _solve_ridge(X: np.ndarray, Y: np.ndarray, lam: float) -> Tuple[np.ndarray, 
 # ===================================================================
 
 
+# ===================================================================
+# Learned tier
+# ===================================================================
+
+
+class LearnedPredictor(Predictor):
+    """Predictors trained cheaply in-process, whose state is a small `weights.npz`.
+
+    The tier owns the round-trip: subclasses keep their own `save_weights` /
+    `load_weights` (they know their own arrays), and this base turns those into
+    the fold-addressed operations the CLI drives — `persist`, `restore`,
+    `is_trained`.
+
+    `fit` stays PURE (train in memory, touch no disk). That is load-bearing:
+    `verify` fits predictors on synthetic stores, and `Mean+TargetScaling` fits
+    sub-predictors internally — if `fit` persisted, both would scribble stray
+    weight files into the real `models/` tree. Persisting is therefore an
+    explicit second step that only `run_pipeline fit` takes.
+    """
+
+    needs_training = True
+
+    @classmethod
+    def _weights_file(cls, dataset: str, scenario: str, fold: int) -> Path:
+        return weights_path(dataset, cls.name, scenario, fold)
+
+    def is_trained(self, store, scenario: str, fold: int) -> bool:
+        """Present AND readable AND non-empty.
+
+        A bare `.exists()` is what made the old CLI gate lie: a killed `fit`
+        leaves a truncated npz that exists but cannot be loaded, and the base
+        class used to write a deliberately EMPTY npz for every predictor. Open
+        it and require at least one array, so those both read as "not trained".
+        (Not yet checked: whether the weights match the current code/params —
+        that needs a fingerprint stored inside the npz.)"""
+        path = self._weights_file(store.dataset, scenario, fold)
+        if not path.exists():
+            return False
+        try:
+            with np.load(str(path), allow_pickle=True) as z:
+                return len(z.files) > 0
+        except Exception:
+            return False
+
+    def persist(self, store, scenario: str, fold: int) -> Path:
+        """Write this fold's trained coefficients; returns the path written."""
+        path = self._weights_file(store.dataset, scenario, fold)
+        self.save_weights(path)
+        return path
+
+    @classmethod
+    def restore(cls, store, scenario: str, fold: int) -> "LearnedPredictor":
+        """Rebuild a fitted instance from this fold's `weights.npz`."""
+        return cls.load_weights(cls._weights_file(store.dataset, scenario, fold))
+
+
 @register
-class Ridge(Predictor):
+class Ridge(LearnedPredictor):
     """Ridge regression on multi-hot perturbation + bin features."""
     name = "Ridge"
     needs_training = True
@@ -192,7 +248,7 @@ class LinearAdditive(Ridge):
 
 
 @register
-class BilinearRidge(Predictor):
+class BilinearRidge(LearnedPredictor):
     """Y = G W P with ridge solver. G is the PCA basis of training pseudobulks,
     and P is restricted to perturbed genes that appear in G's row space.
 
@@ -353,7 +409,7 @@ class BilinearRidge(Predictor):
 
 
 @register
-class Correlation(Predictor):
+class Correlation(LearnedPredictor):
     """For each test KO, find the most-correlated training KO and predict its delta.
 
     Same-bin matching is preferred: for each test (bin, ko), the nearest training
@@ -454,7 +510,7 @@ class Correlation(Predictor):
 
 
 @register
-class TargetScaling(Predictor):
+class TargetScaling(LearnedPredictor):
     """Pure target-only baseline in delta space.
 
     Prediction:
@@ -604,7 +660,7 @@ class TargetScaling(Predictor):
 
 
 @register
-class MeanPlusTargetScaling(Predictor):
+class MeanPlusTargetScaling(LearnedPredictor):
     """Composite simple baseline: the regime's mean-delta baseline PLUS the
     TargetScaling target-gene correction.
 
@@ -680,7 +736,7 @@ class MeanPlusTargetScaling(Predictor):
 
 
 @register
-class GlobalEpistasis(Predictor):
+class GlobalEpistasis(LearnedPredictor):
     """Combo predictor: Δ_AB = Δ_A + Δ_B + W [Δ_A ⊙ Δ_B].
 
     `W` is a per-gene scalar learned by least-squares on the training combos.
@@ -892,7 +948,7 @@ def _build_pert_emb(
 
 
 @register
-class LatentAdditive(Predictor):
+class LatentAdditive(LearnedPredictor):
     """Bilinear linear+embedding predictor (Ahlmann-Eltze et al. 2025).
 
     Closed-form ridge solver — no SGD, no MLP, no PyTorch. Trains in O(n_genes·k²)
