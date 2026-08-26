@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Generate per-model DL vocabulary references under ``data/ref/dl_model_vocab/``.
 
-The benchmark's DL fold-alignment gate (``benchmark/_fold_align.py``) is
-*gene-set aware*: when a model's per-fold test set is a subset of our h5ad fold,
-the gate classifies each absent perturbation as **out-of-vocabulary** (the model
-structurally cannot represent that gene) vs **in-vocab-but-dropped** (a different
-upstream filter). That classification needs a saved, human-readable record of
-what each model *can* represent — this script produces it.
+HISTORICAL. This fed the DL fold-alignment gate (``benchmark/_fold_align.py``),
+which was *gene-set aware*: when a model's per-fold test set was a subset of our
+h5ad fold, the gate classified each absent perturbation as **out-of-vocabulary**
+(the model structurally cannot represent that gene) vs **in-vocab-but-dropped**
+(a different upstream filter). That gate and the adapter tier it checked are
+deleted; this script is kept only to document how the existing artifacts under
+``data/ref/dl_model_vocab/`` were produced.
 
 Sources (confirmed in-repo / collaborator tree), one artifact per model:
   * scGPT   — GLOBAL token vocabulary `vocab.json` (~60.7k symbols), saved per run
