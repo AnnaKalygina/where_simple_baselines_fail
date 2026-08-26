@@ -154,6 +154,53 @@ def test_fit_leaves_no_claim_behind(trained):
     assert not (p._run_dir(store, "UnseenPert", 0) / CLAIM_FILE).exists()
 
 
+def test_a_crashed_retrain_does_not_leave_a_dir_that_reports_itself_trained(
+        trained, monkeypatch):
+    """The bug this tier had, and the reason the fix belongs in `fit`.
+
+    This tier does NOT wipe its run dir, so a crashed retrain leaves the previous
+    fingerprint standing over artefacts the crash touched — `is_trained` said
+    yes, `fit` skipped it next time, and `predict` scored it. Worse than stale:
+    the trainer checkpoints DURING training while `norm_stats.npz` is written
+    only after it returns, so the surviving weights and the surviving sigma come
+    from different runs. Nothing crashes; the number is just wrong.
+    """
+    p, store = trained
+    run_dir = p._run_dir(store, "UnseenPert", 0)
+    sigma_before = np.load(str(run_dir / "norm_stats.npz"))["sigma"].copy()
+
+    def boom(*a, **k):
+        # Leave a plausible half-written checkpoint behind, as a real OOM would.
+        torch.save({"state_dict": {}, "sabotaged": True},
+                   str(run_dir / "checkpoint_best.pt"))
+        raise RuntimeError("simulated OOM mid-training")
+    monkeypatch.setattr(p, "_train", boom)
+
+    with pytest.raises(RuntimeError, match="simulated OOM"):
+        p.fit(store, "UnseenPert", 0, force=True)
+
+    # The artefacts survive (this tier does not wipe) and the stats are still the
+    # PREVIOUS run's — exactly the mismatch. What must not survive is the claim
+    # that they belong together.
+    assert (run_dir / "checkpoint_best.pt").exists()
+    assert np.array_equal(np.load(str(run_dir / "norm_stats.npz"))["sigma"], sigma_before)
+    assert not (run_dir / FINGERPRINT_FILE).exists()
+    assert not p.is_trained(store, "UnseenPert", 0)
+    assert FINGERPRINT_FILE in p.unusable_reason(store, "UnseenPert", 0)
+
+    with pytest.raises(RuntimeError, match="no usable trained model"):
+        p.predict(store, "UnseenPert", 0)
+
+
+def test_the_torch_tier_sets_its_own_claim_ttl(trained):
+    """Nothing kills an in-process run, so there is no `train_timeout` to borrow
+    for the abandoned-claim horizon. Inheriting the base 24 h would be a number
+    nobody chose."""
+    p, _ = trained
+    assert p._claim_ttl() == p.claim_ttl_seconds
+    assert p._claim_ttl() != 24 * 3600
+
+
 # ---------------------------------------------------------------------------
 # Coverage honesty
 # ---------------------------------------------------------------------------

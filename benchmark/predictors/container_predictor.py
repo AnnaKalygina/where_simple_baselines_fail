@@ -2,9 +2,9 @@
 
 DL models are trained + inferred **inside our own leak-safe splits** and scored
 identically to baselines — there is no external-prediction adoption, no
-fold-alignment, no MANIFEST (that path, ``dl_adapter.py``, is deleted at M3).
-``fit`` trains in the model's ``.sif``; ``predict`` infers and maps the
-container's ``predictions.h5ad`` onto the benchmark delta tensor.
+fold-alignment, no MANIFEST. That path (``dl_adapter.py`` + ``_fold_align.py``)
+has been deleted. ``fit`` trains in the model's ``.sif``; ``predict`` infers and
+maps the container's ``predictions.h5ad`` onto the benchmark delta tensor.
 
 Combined-form feed (the atheus-native + only intake, verified GEARS+PRESAGE):
 the container is handed ONE combined h5ad (``data_path``) carrying the
@@ -18,10 +18,11 @@ per-model ``docker/<model>/model.yaml`` co-located with the model, loaded lazily
 attributes — those are read by ``verify`` in a pyyaml-less env, so they must not
 depend on the yaml.
 
-Transitional naming: while the old external-adoption predictors ``GEARS`` /
-``PRESAGE`` (``dl_adapter.py``) still coexist (through M2), the container-trained
-versions register under ``-ct`` names (``GEARS-ct`` / ``PRESAGE-ct``, "container
-trained"). M3 deletes the adapter and collapses the name.
+Naming: these register under ``-ct`` names (``GEARS-ct`` / ``PRESAGE-ct``,
+"container trained"), which dates from when the external-adoption ``GEARS`` /
+``PRESAGE`` predictors coexisted with them. Those are now deleted, so the suffix
+is free to be dropped — a rename that touches saved prediction paths and results
+CSVs, and so is deliberately not bundled with the deletion.
 """
 from __future__ import annotations
 
@@ -36,7 +37,7 @@ from benchmark.config import (
     h5ad_path, split_obs_column, predictor_dir, checkpoint_dir, parse_target_genes)
 from benchmark.data_loader import DatasetStore
 from benchmark.predictors.base import register
-from benchmark.predictors.trained import TrainedPredictor
+from benchmark.predictors.trained import CLAIM_FILE, TrainedPredictor
 # Host-side glue for container predictors (moved out of docker/harness/ into this
 # package — imported normally, no sys.path shim). None of these import yaml at
 # module top, so importing this predictor stays safe in the pyyaml-less env.
@@ -70,7 +71,6 @@ class ContainerPredictor(TrainedPredictor):
     ``_preflight_model_specific``.
     """
 
-    needs_training = True
     # subclass-provided capability declaration (plain Python, read by verify):
     model_dir: str = ""          # repo-relative dir holding this model's model.yaml
 
@@ -302,27 +302,34 @@ class ContainerPredictor(TrainedPredictor):
                 "hyperparameters": recipe["hyperparameters"],
                 "extra_config": self.extra_config}
 
-    def _prepare_run_dir(self, store: DatasetStore, scenario: str, fold: int) -> Path:
+    def _clean_run_dir(self, run_dir: Path) -> None:
         """Train from a clean dir: GEARS reuses whatever cache it finds, so a
-        stale `processed_data/` would be silently trained against. Only reached
-        when the CLI has decided to (re)train — an already-trained fold is
-        skipped before this point, so a concurrent run's dir is not wiped."""
-        run_dir = self._run_dir(store, scenario, fold)
-        if run_dir.exists():                          # B4: fresh dir, no stale cache
-            shutil.rmtree(run_dir)
-        run_dir.mkdir(parents=True, exist_ok=True)
-        return run_dir
+        stale `processed_data/` would be silently trained against.
+
+        Wipes the CONTENTS, not the directory — `fit` has already created it and
+        taken the claim inside it, and deleting the claim is what let two
+        concurrent runs train into one dir. `processed_data/` is itself a
+        directory, so this needs `rmtree` per child; a flat `unlink` loop would
+        raise `IsADirectoryError` on precisely the cache this exists to remove.
+        """
+        for child in run_dir.iterdir():
+            if child.name == CLAIM_FILE:
+                continue
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
 
     def _train(self, store: DatasetStore, scenario: str, fold: int,
                run_dir: Path) -> Optional[Dict]:
         cfg = _config.build_config(
             "train", dataset=store.dataset, scenario=scenario, fold=fold,
-            model_name=self.model_yaml_key, seed=self.seed,
+            model_name=self.model_yaml_key, seed=self._seed_for(fold),
             hyperparameters=self.default_hyperparameters, extra_config=self.extra_config)
         if self.wandb_project:                        # opt-in W&B training logs (train only)
             cfg["wandb"] = True
             cfg["wandb_project"] = self.wandb_project
-            cfg["wandb_run"] = f"{self.name}_{store.dataset}_{scenario}_fold{fold}_seed{self.seed}"
+            cfg["wandb_run"] = f"{self.name}_{store.dataset}_{scenario}_fold{fold}_seed{self._seed_for(fold)}"
         _contract.validate_train_config(dict(cfg))    # host-side schema gate
 
         log.info("%s: training %s/%s/fold%d in %s", self.name, store.dataset,
@@ -349,7 +356,7 @@ class ContainerPredictor(TrainedPredictor):
             preds_h5ad.unlink()
         cfg = _config.build_config(
             "predict", dataset=store.dataset, scenario=scenario, fold=fold,
-            model_name=self.model_yaml_key, seed=self.seed,
+            model_name=self.model_yaml_key, seed=self._seed_for(fold),
             hyperparameters=self.default_hyperparameters, extra_config=self.extra_config,
             output_path_host=str(preds_h5ad))
         _contract.validate_predict_config(dict(cfg))

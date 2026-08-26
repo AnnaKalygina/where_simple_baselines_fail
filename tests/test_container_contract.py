@@ -20,7 +20,7 @@ from benchmark.predictors._container.contract import (
 
 OK_TRAIN = {
     "mode": "train", "model": "gears", "dataset": "adamson16",
-    "scenario": "UnseenPert", "regime": "UnseenPert", "fold": 0,
+    "scenario": "UnseenPert", "fold": 0,
     "seed": 42, "data_path": "/data/adamson16_processed.h5ad",
     "split_name": "split_UnseenPert_fold_0", "covariate_key": "cell_type",
     "train_conditions": ["AARS"], "val_conditions": ["BRCA1"],
@@ -86,3 +86,65 @@ def test_scenario_must_be_pascal_case_not_a_legacy_sN_name():
     container be configured with a scenario the benchmark cannot map back."""
     with pytest.raises(ContractError, match="not one of"):
         validate_train_config({**OK_TRAIN, "scenario": "S3"})
+
+
+# ---------------------------------------------------------------------------
+# Model-specific extras (`model.yaml` -> `extra_config:`)
+# ---------------------------------------------------------------------------
+# The schema deliberately does NOT name these — GEARS' `gene2go_path`, PRESAGE's
+# `presage_cache_path` — because this module is the shared contract, and listing
+# one model's keys in it makes every other model look like a special case. What
+# it can still say is that a key it does not own must be a JSON scalar: extras
+# are hashed into the run fingerprint and serialised into config.json, so a
+# nested value fails later and far from its cause.
+
+
+@pytest.mark.parametrize("extra", [
+    {"gene2go_path": "/app_code/gears/gene2go_all.pkl"},      # GEARS
+    {"presage_cache_path": "/opt/presage_cache"},             # PRESAGE
+    {"some_flag": True, "some_count": 3, "some_ratio": 0.5},  # any scalar
+])
+def test_scalar_extras_pass_without_being_named_in_the_schema(extra):
+    validate_train_config({**OK_TRAIN, **extra})
+    validate_predict_config({**OK_PREDICT, **extra})
+
+
+@pytest.mark.parametrize("bad", [
+    {"gene2go_path": ["a", "b"]},
+    {"presage_cache_path": {"nested": 1}},
+])
+def test_non_scalar_extras_are_rejected(bad):
+    for validate, cfg in ((validate_train_config, OK_TRAIN),
+                          (validate_predict_config, OK_PREDICT)):
+        with pytest.raises(ContractError, match="JSON scalars"):
+            validate({**cfg, **bad})
+
+
+def test_a_known_field_keeps_its_own_type_check_and_is_not_treated_as_an_extra():
+    """`hyperparameters` is a dict on purpose; the scalar rule must not catch it."""
+    validate_train_config({**OK_TRAIN, "hyperparameters": {"epochs": 20}})
+    with pytest.raises(ContractError, match="must be dict"):
+        validate_train_config({**OK_TRAIN, "hyperparameters": "epochs=20"})
+
+
+# ---------------------------------------------------------------------------
+# `regime` was removed from the schema
+# ---------------------------------------------------------------------------
+# It was written as a verbatim copy of `scenario` and read by no wrapper — the
+# same defect `_container/config.py` records having already fixed once, when
+# `covariate_field`/`covariate_key` were the duplicated pair. A field nothing
+# reads is a field that can silently disagree with the one that matters.
+
+
+def test_regime_is_no_longer_emitted_by_build_config():
+    from benchmark.predictors._container.config import build_config
+    import inspect
+    assert "regime" not in inspect.getsource(build_config)
+
+
+def test_a_stray_regime_is_now_just_an_extra_and_must_be_scalar():
+    """Removing it from the schema must not turn a leftover `regime:` into a
+    hard error for anyone mid-migration — it falls through to the extras rule."""
+    validate_train_config({**OK_TRAIN, "regime": "UnseenPert"})
+    with pytest.raises(ContractError, match="JSON scalars"):
+        validate_train_config({**OK_TRAIN, "regime": ["UnseenPert"]})

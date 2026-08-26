@@ -71,7 +71,7 @@ def build_config(mode: str, *, dataset: str, scenario: str, fold: int,
     if mode == "train":
         cfg.update({
             "model": model_name, "dataset": dataset, "scenario": scenario,
-            "regime": scenario, "fold": int(fold), "seed": int(seed),
+            "fold": int(fold), "seed": int(seed),
             "train_conditions": conds["train"],
             "val_conditions": conds["val"],
             "test_conditions": conds["test"],

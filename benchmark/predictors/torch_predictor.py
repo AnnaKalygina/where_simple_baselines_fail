@@ -47,6 +47,17 @@ class TorchPredictor(TrainedPredictor):
     #: None => fold-derived seed (see `_seed_for`); set to pin one.
     seed: Optional[int] = None
 
+    #: How long before a `RUNNING.json` from this tier is presumed abandoned.
+    #: The container tier reuses its `train_timeout` for this, because there the
+    #: timeout really does kill the run. Nothing kills an in-process torch run,
+    #: so there is no timeout to borrow — inheriting the base class's 24 h would
+    #: be a number nobody chose. 12 h is above the longest observed fold
+    #: (~3 h for 12x1 on one GPU) with room for a slower card or a busy node.
+    claim_ttl_seconds: float = 12 * 3600
+
+    def _claim_ttl(self) -> float:
+        return float(self.claim_ttl_seconds)
+
 
     # ------------------------------------------------------------------
     # Subclass hook

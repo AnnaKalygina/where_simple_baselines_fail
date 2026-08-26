@@ -13,9 +13,10 @@ keeps `_recipe`/`sif_path`/`entry`/`code_binds`/`run_container`, the torch tier
 keeps its model and training loop, and everything either could have written
 twice now lives here once.
 
-The contract for subclasses is four hooks:
+The contract for subclasses is five hooks:
 
     _expected_artifacts()            what must exist for a run to count as trained
+    _recipe_fingerprint()            what changes what training DOES
     _leakage_gate(...)               prove no held-out cell reaches training
     _train(store, sc, fold, run_dir) do the expensive thing; leave those artefacts
     _infer(store, sc, fold, run_dir)  -> (n_test_bins, n_test_kos, n_genes) deltas
@@ -104,18 +105,23 @@ class TrainedPredictor(Predictor):
         """
         raise NotImplementedError
 
+    def _recipe_fingerprint(self) -> Dict:
+        """Everything that changes what training DOES — hyperparameters, schedule,
+        architecture. Hashed into the run identity so a recipe edit invalidates
+        the checkpoints it no longer describes.
+
+        MANDATORY, despite reading like a detail: `_fingerprint` calls it
+        unconditionally, so a subclass that omits it fails from `is_trained` —
+        i.e. after the GPU time, not at definition.
+        """
+        raise NotImplementedError
+
     # ------------------------------------------------------------------
     # Optional hooks
     # ------------------------------------------------------------------
 
     def _preflight(self, store: DatasetStore, scenario: str, fold: int) -> None:
         """Cheap checks before an expensive run (default: none)."""
-
-    def _recipe_fingerprint(self) -> Dict:
-        """Everything that changes what training DOES — hyperparameters, schedule,
-        architecture. Hashed into the run identity so a recipe edit invalidates
-        the checkpoints it no longer describes."""
-        raise NotImplementedError
 
     def _fingerprint(self, store: DatasetStore, scenario: str, fold: int) -> Dict:
         """The identity of a training run: what must still hold for its
@@ -133,9 +139,11 @@ class TrainedPredictor(Predictor):
         - ``recipe_sha``     hyperparameters changed -> the checkpoint answers a
           different question than the one being asked
         - ``seed``           a different draw
-        - ``code_sha``       advisory only (see ``_ENFORCED``): reported for
-          provenance, not enforced, or every commit would invalidate every
-          checkpoint.
+        `code_sha` is NOT here: it is advisory (see ``_ENFORCED``), so computing
+        it would cost a `git` subprocess on every comparison — and this runs once
+        per (dataset x scenario x fold) in any roster or sweep, through
+        ``is_trained``. It is stamped in ``_write_fingerprint`` instead, which
+        runs once per training run.
         """
         return {
             "predictor": self.name,
@@ -146,7 +154,6 @@ class TrainedPredictor(Predictor):
             "gene_axis_sha": _sha_strings(store.gene_names),
             "split_sha": _sha_split(store, scenario, fold),
             "recipe_sha": _sha_json(self._recipe_fingerprint()),
-            "code_sha": _git_head(),
         }
 
     #: Fields whose disagreement makes a checkpoint unusable. `code_sha` is
@@ -156,6 +163,7 @@ class TrainedPredictor(Predictor):
     def _write_fingerprint(self, store: DatasetStore, scenario: str, fold: int,
                            run_dir: Path, extra: Optional[Dict] = None) -> None:
         fp = self._fingerprint(store, scenario, fold)
+        fp["code_sha"] = _git_head()          # provenance, stamped once per run
         if extra:
             fp["report"] = extra
         (run_dir / FINGERPRINT_FILE).write_text(json.dumps(fp, indent=2))
@@ -183,12 +191,14 @@ class TrainedPredictor(Predictor):
                         f"retrain with --force")
         return None
 
-    def _prepare_run_dir(self, store: DatasetStore, scenario: str,
-                         fold: int) -> Path:
-        """Make a clean run dir for training (default: create, keep existing)."""
-        run_dir = self._run_dir(store, scenario, fold)
-        run_dir.mkdir(parents=True, exist_ok=True)
-        return run_dir
+    def _clean_run_dir(self, run_dir: Path) -> None:
+        """Remove whatever a previous run left that this one must not inherit.
+
+        Default: nothing — a tier that overwrites its own artefacts needs no
+        wipe. `fit` has already created the dir and taken the claim, so an
+        override must leave `CLAIM_FILE` alone: it is what stops a second
+        process from training into the same directory.
+        """
 
     # ------------------------------------------------------------------
     # Paths / identity
@@ -199,6 +209,14 @@ class TrainedPredictor(Predictor):
         return checkpoint_dir(store.dataset, self.name, scenario, fold)
 
     def _seed_for(self, fold: int) -> int:
+        """The seed this fold trains under. Override to derive it from the fold.
+
+        Every caller must go through this rather than reading `self.seed` — the
+        fingerprint records `_seed_for(fold)` as an ENFORCED field, so a tier
+        that overrides it while some code path still passes `self.seed` would
+        certify a checkpoint under a seed the model never saw. `TorchPredictor`
+        does override it, so this is a live hazard, not a hypothetical one.
+        """
         return self.seed
 
     def _check_scenario(self, scenario: str) -> None:
@@ -236,21 +254,38 @@ class TrainedPredictor(Predictor):
     # ------------------------------------------------------------------
 
     def fit(self, store: DatasetStore, scenario: str, fold: int,
-            force: bool = False) -> None:
+            force: bool = False, steal: bool = False) -> None:
         """Gate, claim, train, then prove the run dir is actually usable.
 
         The post-condition matters: a crashed or half-written run must fail HERE,
         while the cause is on screen, not later at predict where the error would
         be far from what produced it.
+
+        `force` decides whether to retrain a fold that is ALREADY trained; that
+        question is settled by the caller (`run_pipeline`) before `fit` is
+        reached, which is why it is unused here. `steal` is the separate, rarer
+        decision to train into a directory another process currently claims.
+        Keeping them apart matters: `--force` is routine, and it must not
+        silently double as permission to collide with a running job.
         """
         self._check_scenario(scenario)
         self._preflight(store, scenario, fold)
         self._leakage_gate(store, scenario, fold)
 
-        self._assert_unclaimed(store, scenario, fold, force=force)
-        run_dir = self._prepare_run_dir(store, scenario, fold)
-        self._claim(run_dir)
+        run_dir = self._run_dir(store, scenario, fold)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self._acquire_claim(run_dir, steal=steal)
         try:
+            # Retract the previous run's certificate BEFORE touching its
+            # artefacts. Without this a crash mid-retrain leaves the old
+            # fingerprint standing over half-written weights: `is_trained` says
+            # yes, the next `fit` skips it, and `predict` scores it. The torch
+            # tier is where it bites — it writes `norm_stats.npz` only after
+            # training, so the surviving stats belong to a DIFFERENT run than the
+            # surviving weights. Doing it here rather than in a tier's wipe means
+            # the guarantee is the template's, not one subclass's side effect.
+            (run_dir / FINGERPRINT_FILE).unlink(missing_ok=True)
+            self._clean_run_dir(run_dir)
             report = self._train(store, scenario, fold, run_dir)
             self._write_fingerprint(store, scenario, fold, run_dir, extra=report)
         except BaseException:
@@ -273,41 +308,67 @@ class TrainedPredictor(Predictor):
     # Concurrency
     # ------------------------------------------------------------------
 
-    def _assert_unclaimed(self, store: DatasetStore, scenario: str, fold: int,
-                          *, force: bool) -> None:
-        """Refuse to train into a run dir another process is already using.
+    def _acquire_claim(self, run_dir: Path, *, steal: bool) -> None:
+        """Take an exclusive claim on `run_dir`, or refuse to train into it.
 
-        Without this, two SLURM array tasks for the same (dataset, scenario, fold)
-        both see `is_trained == False`, both wipe the dir, and both write into it.
-        A claim older than this model's train timeout is treated as abandoned.
+        Atomic by construction: `O_CREAT | O_EXCL` either creates the file or
+        fails, in one syscall. The previous check-then-write version had a window
+        between them — two array tasks for the same (dataset, scenario, fold)
+        both saw no claim, both proceeded, and the container tier's wipe then
+        deleted the winner's claim on the way past. A multi-GB `rmtree` made that
+        window wide enough to lose races in practice, not just in theory.
+
+        Reclaimed automatically when the claim is unreadable or older than this
+        model's timeout; overridden deliberately with `steal`. Never overridden
+        by `--force`, which answers a different question.
         """
-        claim_path = self._run_dir(store, scenario, fold) / CLAIM_FILE
-        if not claim_path.exists() or force:
-            return
-        try:
-            claim = json.loads(claim_path.read_text())
-            age = time.time() - float(claim.get("started_at", 0))
-        except (OSError, ValueError):
-            log.warning("%s: unreadable %s — treating as abandoned",
-                        self.name, CLAIM_FILE)
-            return
-        if age > self._claim_ttl():
-            log.warning("%s: stale claim from %s (pid %s, %.1f h old) — reclaiming",
-                        self.name, claim.get("host"), claim.get("pid"), age / 3600)
-            return
+        claim_path = run_dir / CLAIM_FILE
+        for attempt in ("first", "after-reclaim"):
+            try:
+                fd = os.open(claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                pass
+            else:
+                with os.fdopen(fd, "w") as fh:
+                    json.dump({"host": socket.gethostname(), "pid": os.getpid(),
+                               "started_at": time.time(), "predictor": self.name},
+                              fh, indent=2)
+                return
+            if attempt == "after-reclaim":
+                # Someone re-claimed between our unlink and our retry: they won.
+                break
+            reason = self._reclaimable(claim_path, steal=steal)
+            if reason is None:
+                break
+            log.warning("%s: %s — reclaiming %s", self.name, reason, claim_path)
+            claim_path.unlink(missing_ok=True)
+
+        claim = _read_claim(claim_path) or {}
+        age = time.time() - float(claim.get("started_at", 0)) if claim else 0.0
+        who = (f"pid {claim.get('pid')} on {claim.get('host')} "
+               f"({age / 60:.0f} min ago)" if claim else "another process")
         raise RuntimeError(
-            f"{self.name}: {store.dataset}/{scenario}/fold{fold} is already being "
-            f"trained by pid {claim.get('pid')} on {claim.get('host')} "
-            f"({age / 60:.0f} min ago). Wait for it, or pass --force to override.")
+            f"{self.name}: {run_dir} is already claimed by {who}. Wait for it to "
+            f"finish, or pass --steal-claim to train into that directory anyway "
+            f"(which will corrupt the other run if it is still alive).")
+
+    def _reclaimable(self, claim_path: Path, *, steal: bool) -> Optional[str]:
+        """Why an existing claim may be taken over, or None to respect it."""
+        claim = _read_claim(claim_path)
+        if claim is None:
+            return f"unreadable {CLAIM_FILE}"
+        age = time.time() - float(claim.get("started_at", 0))
+        if age > self._claim_ttl():
+            return (f"stale claim from {claim.get('host')} "
+                    f"(pid {claim.get('pid')}, {age / 3600:.1f} h old)")
+        if steal:
+            return (f"--steal-claim over a LIVE claim from {claim.get('host')} "
+                    f"(pid {claim.get('pid')}, {age / 60:.0f} min old)")
+        return None
 
     def _claim_ttl(self) -> float:
         """Seconds after which a claim is presumed abandoned."""
         return float(getattr(self, "train_timeout", 0) or 24 * 3600)
-
-    def _claim(self, run_dir: Path) -> None:
-        (run_dir / CLAIM_FILE).write_text(json.dumps({
-            "host": socket.gethostname(), "pid": os.getpid(),
-            "started_at": time.time(), "predictor": self.name}, indent=2))
 
     def _report_wreckage(self, run_dir: Path) -> None:
         try:
@@ -359,6 +420,14 @@ _STALE_REASON = {
     "split_sha": "the train/test split",
     "recipe_sha": "the training recipe",
 }
+
+
+def _read_claim(path: Path) -> Optional[Dict]:
+    """Parse a claim file, or None if it is absent or unreadable."""
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def _sha_strings(items) -> str:

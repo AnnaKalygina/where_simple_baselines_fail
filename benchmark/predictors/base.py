@@ -5,13 +5,15 @@ the same `Predictor` interface:
 
   * `fit(store, scenario, fold)`       — train (no-op for analytical)
   * `predict(store, scenario, fold)`   — return (n_test_bins, n_test_kos, n_genes)
-  * `save_weights(path)`               — serialize parameters (empty for analytical)
-  * `load_weights(path)`               — reconstruct from weights.npz
+  * `is_trained(store, scenario, fold)` — is there usable trained state for this fold
   * `save_predictions(path, ...)`      — write self-describing NPZ (gene/ko/bin names)
 
-The save/load roundtrip + `load_predictions()` enforce the gene-alignment
-invariant: a `predictions.npz` whose `gene_names` array does not match the
-dataset's `var_names` cannot be silently consumed downstream.
+`save_predictions` + `load_predictions()` enforce the gene-alignment invariant: a
+`predictions.npz` whose `gene_names` array does not match the dataset's
+`var_names` cannot be silently consumed downstream.
+
+Persistence is deliberately NOT part of this interface — it means something
+different per tier, so each tier owns it. See `Predictor.is_trained` for why.
 """
 from __future__ import annotations
 
@@ -52,9 +54,18 @@ class GeneAlignmentError(ValueError):
 class Predictor(ABC):
     """Base class for all benchmark predictors.
 
-    Subclasses MUST set the class attributes `name`, `needs_training`, and
-    `scenarios` (the list of PascalCase scenario names this predictor can
-    handle). Instances are typically constructed via the registry:
+    Subclasses MUST set the class attributes `name` and `scenarios` (the list of
+    PascalCase scenario names this predictor can handle).
+
+    `needs_training` is NOT among them: it is a property of the TIER, declared
+    once on each tier base (False here, True on `LearnedPredictor` and
+    `TrainedPredictor`) and inherited. It used to be restated on all 22 concrete
+    predictors, which is 19 chances to state it wrong. It stays declared rather
+    than derived because there is no honest derivation — a no-op `fit` means True
+    for a model trained elsewhere and False for an analytical baseline, so any
+    predicate over `fit` misclassifies one of them.
+
+    Instances are typically constructed via the registry:
 
         predictor = PREDICTOR_REGISTRY[name](**kwargs)
 
@@ -258,19 +269,25 @@ def _ensure_predictors_loaded() -> None:
 def predictor_category(cls) -> str:
     """Grouping used by `--predictor <category>`, DERIVED — never declared.
 
-    Tier first (a container/adapter is `dl`, anything persisting a weights.npz is
-    `learned`), then the defining module for the stateless families that the
-    class hierarchy genuinely does not distinguish: `analytical` and `controls`
-    are both plain stateless `Predictor`s, so only their module separates them.
+    Tier first (anything whose training costs GPU-hours is `dl`, anything
+    persisting a weights.npz is `learned`), then the defining module for the
+    stateless families that the class hierarchy genuinely does not distinguish:
+    `analytical` and `controls` are both plain stateless `Predictor`s, so only
+    their module separates them.
+
+    `dl` asks the TIER, not a list of its subclasses. It was a two-element tuple
+    while `DLAdapter` existed — models trained OUTSIDE this repo, which the tier
+    could not describe — and collapsed to one predicate when that tier was
+    deleted. A derived predicate stays multi-valued exactly as long as its domain
+    does.
 
     Imports are deferred to call time: these modules import `base`, so importing
     them at module level would be circular.
     """
     from benchmark.predictors.learned import LearnedPredictor
-    from benchmark.predictors.container_predictor import ContainerPredictor
-    from benchmark.predictors.dl_adapter import DLAdapter
+    from benchmark.predictors.trained import TrainedPredictor
 
-    if issubclass(cls, (ContainerPredictor, DLAdapter)):
+    if issubclass(cls, TrainedPredictor):
         return "dl"
     if issubclass(cls, LearnedPredictor):
         return "learned"

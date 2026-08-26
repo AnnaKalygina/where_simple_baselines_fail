@@ -165,7 +165,6 @@ class LearnedPredictor(Predictor):
 class Ridge(LearnedPredictor):
     """Ridge regression on multi-hot perturbation + bin features."""
     name = "Ridge"
-    needs_training = True
     scenarios = ["UnseenPert", "UnseenCell", "UnseenBoth", "UnseenPair", "UnseenCombo"]
 
     def __init__(self, ridge_lambda: float = 1.0):
@@ -256,7 +255,6 @@ class BilinearRidge(LearnedPredictor):
     """
     name = "BilinearRidge"
     has_drop_rule = True
-    needs_training = True
     scenarios = ["UnseenPert"]
 
     def __init__(self, n_components: int = 10, g_ridge: float = 0.1, p_ridge: float = 0.1):
@@ -419,7 +417,6 @@ class Correlation(LearnedPredictor):
     substitution into another predictor's output).
     """
     name = "Correlation"
-    needs_training = True
     scenarios = ["UnseenPert", "UnseenBoth"]
 
     def __init__(self):
@@ -529,7 +526,6 @@ class TargetScaling(LearnedPredictor):
     """
     name = "TargetScaling"
     has_drop_rule = True
-    needs_training = True
     scenarios = [
         "UnseenPert", "UnseenCell", "UnseenBoth", "UnseenPair",
         "UnseenDose", "UnseenCombo",
@@ -679,7 +675,6 @@ class MeanPlusTargetScaling(LearnedPredictor):
     """
 
     name = "Mean+TargetScaling"
-    needs_training = True            # the TargetScaling alpha is fit by OLS
     has_drop_rule = True             # safe superset (the mean component may drop on some regimes)
     scenarios = ["UnseenPert", "UnseenCell", "UnseenBoth", "UnseenPair"]
 
@@ -743,7 +738,6 @@ class GlobalEpistasis(LearnedPredictor):
     """
     name = "GlobalEpistasis"
     has_drop_rule = True
-    needs_training = True
     scenarios = ["UnseenCombo"]
 
     def __init__(self, ridge_lambda: float = 1.0):
@@ -960,7 +954,6 @@ class LatentAdditive(LearnedPredictor):
     """
     name = "LatentAdditive"
     has_drop_rule = True
-    needs_training = True
     scenarios = [
         "UnseenPert", "UnseenCell", "UnseenBoth", "UnseenPair", "UnseenCombo",
     ]

@@ -46,7 +46,7 @@ def _optional(cfg: dict, key: str, types, where: str):
 #: `_check_extras` requires them to be JSON scalars, which is all this layer can
 #: meaningfully say about a key it does not own.
 _KNOWN_FIELDS = frozenset({
-    "mode", "model", "dataset", "scenario", "regime", "fold", "seed",
+    "mode", "model", "dataset", "scenario", "fold", "seed",
     "data_path", "split_name", "covariate_key",
     "train_conditions", "val_conditions", "test_conditions",
     "hyperparameters", "output_dir", "checkpoint_dir", "model_path", "output_path",
@@ -74,9 +74,6 @@ def validate_train_config(cfg: dict) -> dict:
     scenario = _require(cfg, "scenario", str, where)
     if scenario not in REGIMES:
         raise ContractError(f"{where}: scenario {scenario!r} not one of {REGIMES}")
-    regime = _require(cfg, "regime", str, where)
-    if regime not in REGIMES:
-        raise ContractError(f"{where}: regime {regime!r} not one of {REGIMES}")
     fold = _require(cfg, "fold", int, where)
     if fold < 0:
         raise ContractError(f"{where}: fold must be >= 0, got {fold}")
@@ -105,6 +102,12 @@ def validate_predict_config(cfg: dict) -> dict:
         raise ContractError(f"{where}: mode must be 'predict', got {cfg.get('mode')!r}")
     # Predict re-reads the SAME combined h5ad (must still carry the test cells +
     # split column) and reloads the trained model dir.
+    #
+    # Deliberately fewer REQUIRED fields than the train validator: predict needs
+    # only what it takes to locate the model and the test cells. `model`,
+    # `dataset`, `fold` and the train/val condition lists describe how training
+    # was configured, which predict does not re-decide — a container that needs
+    # them reads them back from its own checkpoint, not from this config.
     _require(cfg, "data_path", str, where)
     _require(cfg, "split_name", str, where)
     _require(cfg, "model_path", str, where)

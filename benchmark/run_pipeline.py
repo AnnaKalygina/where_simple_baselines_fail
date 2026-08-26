@@ -52,25 +52,6 @@ from benchmark.predictors.trained import TrainedPredictor
 log = logging.getLogger(__name__)
 
 
-# DL-adapter predictors are scored ONLY when the manifest lists them for the
-# (dataset, scenario). This prevents stale/orphan predictions.npz left on disk
-# (e.g. a superseded PRESAGE cell-axis run) from being silently scored.
-_DL_MANIFEST_KEY = {"scGPT": "scgpt", "GEARS": "gears", "PRESAGE": "presage"}
-
-
-def _manifest_backed(dataset: str, scenario: str, predictor: str) -> bool:
-    key = _DL_MANIFEST_KEY.get(predictor)
-    if key is None:
-        return True  # not a DL-adapter predictor — always eligible
-    try:
-        from benchmark.predictors.dl_adapter import load_manifest, get_model_folds
-        return key in get_model_folds(load_manifest(), dataset, scenario)
-    except Exception as e:  # manifest unreadable → don't block legitimate scoring
-        log.warning("manifest check failed (%s/%s %s): %s — scoring anyway",
-                    dataset, scenario, predictor, e)
-        return True
-
-
 # ===================================================================
 # Safe CSV writes (atomic + lock-protected read-modify-write)
 # ===================================================================
@@ -106,8 +87,8 @@ def _file_lock(path: Path) -> Iterator[None]:
 def predictor_categories() -> Dict[str, List[str]]:
     """category -> sorted predictor names, derived from the registry.
 
-    Replaces a hand-maintained table that had already drifted: it listed
-    scGPT/GEARS/PRESAGE under "dl" but not GEARS-ct, so `--predictor dl`
+    Replaces a hand-maintained table that had already drifted: it listed the
+    adopted-DL adapters under "dl" but not GEARS-ct, so `--predictor dl`
     silently skipped the container model.
     """
     _ensure_predictors_loaded()
@@ -173,11 +154,31 @@ def _resolve_folds(spec: str, dataset: str, scenario: str) -> List[int]:
     return [f for f in sorted(set(out)) if 0 <= f < n]
 
 
+def predictor_groups() -> Dict[str, List[str]]:
+    """Named selector groups for `--predictor`, alongside the derived categories.
+
+    A category is DERIVED (one per class, from the tier — see
+    `base.predictor_category`). A group is DECLARED: a set someone chose, which
+    the class hierarchy has no way to know. Both are legitimate; they answer
+    different questions, so they are separate lookups rather than one table.
+
+    `transformers` is the KxN sweep. Its membership is sourced from
+    `_torch.recipe.MODELS`, where it is already stated as policy — "Keep the
+    whole set, or the comparison it encodes is lost" — so the group cannot drift
+    from the experiment it names. That module imports no torch, so reading it
+    here is safe in every env that loads the registry.
+    """
+    _ensure_predictors_loaded()
+    from benchmark.predictors import transformers
+    return {"transformers": list(transformers.__all__)}
+
+
 def _resolve_predictors(spec: str) -> List[str]:
     _ensure_predictors_loaded()
     if spec == "all":
         return sorted(PREDICTOR_REGISTRY.keys())
     categories = predictor_categories()
+    groups = predictor_groups()
     out: Set[str] = set()
     for token in spec.split(","):
         token = token.strip()
@@ -185,9 +186,14 @@ def _resolve_predictors(spec: str) -> List[str]:
             continue
         if token in categories:
             out.update(categories[token])
+        elif token in groups:
+            out.update(groups[token])
         elif token in PREDICTOR_REGISTRY:
             out.add(token)
         else:
+            # Deliberately NOT a prefix match: `--predictor transformer` (missing
+            # underscore) silently becoming nine GPU training runs is worse than
+            # a warning that names the typo.
             log.warning("Unknown predictor: %s", token)
     return sorted(out)
 
@@ -325,7 +331,8 @@ def cmd_fit(args) -> None:
                 # Only the expensive tier has anything to force: it is what holds
                 # a run claim and wipes a run dir before retraining.
                 if isinstance(model, TrainedPredictor):
-                    model.fit(store, sc, fold, force=getattr(args, "force", False))
+                    model.fit(store, sc, fold, force=getattr(args, "force", False),
+                              steal=getattr(args, "steal_claim", False))
                 else:
                     model.fit(store, sc, fold)
             except FileNotFoundError as e:
@@ -368,19 +375,6 @@ def cmd_predict(args) -> None:
                 log.warning("PREDICT %s/%s/fold%d %s: skipping — %s",
                             ds, sc, fold, p, e)
                 continue
-            # Adoption gate: externally-trained DL predictions must verifiably align
-            # with OUR (scenario, fold) test set before they are written as a
-            # benchmark npz — uniform across regimes (UnseenCell is judged by held-out
-            # cell scoreability). On failure we refuse to adopt (existing npz, if any,
-            # are left untouched). Bypass with --no-verify.
-            if getattr(model, "is_external", False) and not getattr(args, "no_verify", False):
-                ok, reason = model.check_alignment(store, sc, fold, preds=preds)
-                if not ok:
-                    log.error("PREDICT %s/%s/fold%d %s: ALIGNMENT GATE FAILED — not "
-                              "adopting. %s", ds, sc, fold, p, reason)
-                    continue
-                log.info("PREDICT %s/%s/fold%d %s: alignment OK — %s",
-                         ds, sc, fold, p, reason)
             split = store.split(sc, fold)
             tbi = (split.test_bin_indices
                    if split.test_bin_indices is not None and len(split.test_bin_indices) > 0
@@ -417,10 +411,6 @@ def cmd_metrics(args) -> None:
         for p in predictors:
             cls = PREDICTOR_REGISTRY[p]
             if sc not in cls.scenarios:
-                continue
-            if not _manifest_backed(ds, sc, p):
-                log.warning("skip metrics %s/%s/fold%d %s: DL predictor not in manifest "
-                            "(ignoring orphan predictions)", ds, sc, fold, p)
                 continue
             # Panel path, or the canonical union path for panel-independent
             # DL/external predictions (single source of truth in config).
@@ -599,14 +589,9 @@ def cmd_cf(args) -> None:
             cls = PREDICTOR_REGISTRY[p]
             if sc not in cls.scenarios:
                 continue
-            if not _manifest_backed(ds, sc, p):
-                log.warning("skip cf %s/%s/fold%d %s: DL predictor not in manifest "
-                            "(ignoring orphan predictions)", ds, sc, fold, p)
-                continue
-            # A DL model may not cover every fold (e.g. scGPT has no source fold
-            # aligned to one of our folds). Skip — don't crash — exactly as
-            # cmd_metrics does; cf for that predictor exists only on the folds it
-            # actually predicts.
+            # A predictor need not have been run on every fold. Skip — don't
+            # crash — exactly as cmd_metrics does; cf for that predictor exists
+            # only on the folds it actually predicts.
             if existing_predictions_path(ds, p, sc, fold) is None:
                 log.warning("skip cf %s/%s/fold%d %s: predictions missing",
                             ds, sc, fold, p)
@@ -748,18 +733,22 @@ def build_parser() -> argparse.ArgumentParser:
                              help="retrain even if this fold is already trained "
                                   "(default: skip; for container predictors this also "
                                   "re-runs the expensive GPU training and wipes the run dir)")
-        if name in {"fit", "all", "predict"}:
+            ssp.add_argument("--steal-claim", action="store_true",
+                             help="train into a run dir another process currently "
+                                  "claims. Separate from --force on purpose: --force "
+                                  "answers 'retrain an already-trained fold?', this "
+                                  "answers 'collide with a live run?'. A claim older "
+                                  "than the model's timeout is reclaimed without it.")
+        if name in {"fit", "all"}:
             ssp.add_argument("--no-verify", action="store_true",
-                             help="skip verify gates: for fit/all the pre-benchmark L0+L1 "
-                                  "preflight; for predict the DL adoption fold-alignment gate "
-                                  "(otherwise a misaligned DL fold is refused, not written)")
+                             help="skip the pre-benchmark L0+L1 preflight")
         if name == "roster":
             ssp.add_argument("--json", action="store_true",
                              help="emit the roster as JSON for tooling")
         if name == "verify":
             ssp.add_argument("--full", action="store_true",
-                             help="also run L3 (GT-axis) + L6 (fold alignment); needs saved "
-                                  "predictions + the DL manifest")
+                             help="also run L3 (GT-axis) + L6 (prediction alignment); "
+                                  "needs saved predictions")
         ssp.set_defaults(func=handler)
     return p
 

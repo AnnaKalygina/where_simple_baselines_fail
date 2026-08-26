@@ -309,21 +309,121 @@ def test_container_detects_every_staleness_field(isolated_checkpoints, monkeypat
     assert label in p.unusable_reason(store, "UnseenPert", 0)
 
 
+def _plant_claim(p, store, *, age_seconds: float = 0.0):
+    """A claim as another live process would have left it."""
+    import time
+    run_dir = p._run_dir(store, "UnseenPert", 0)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / CLAIM_FILE).write_text(json.dumps(
+        {"host": "other", "pid": 4242, "started_at": time.time() - age_seconds}))
+    return run_dir
+
+
 def test_a_live_claim_blocks_a_second_fit(isolated_checkpoints, monkeypatch, store_on_disk):
     """S5: two array tasks must not train into one run dir."""
-    import time
+    store = store_on_disk(n_bins=1)
+    _stub_container(monkeypatch, store)
+    p = FakeContainer()
+    _plant_claim(p, store)
+
+    with pytest.raises(RuntimeError, match="already claimed"):
+        p.fit(store, "UnseenPert", 0)
+
+
+def test_force_does_not_override_a_live_claim(isolated_checkpoints, monkeypatch, store_on_disk):
+    """`--force` answers "retrain an already-trained fold?" — NOT "collide with a
+    running job?". It used to answer both, which put the exact corruption the
+    claim exists to prevent one routine keystroke away."""
+    store = store_on_disk(n_bins=1)
+    _stub_container(monkeypatch, store)
+    p = FakeContainer()
+    _plant_claim(p, store)
+
+    with pytest.raises(RuntimeError, match="--steal-claim"):
+        p.fit(store, "UnseenPert", 0, force=True)
+
+
+def test_steal_claim_overrides_a_live_claim(isolated_checkpoints, monkeypatch, store_on_disk):
+    store = store_on_disk(n_bins=1)
+    _stub_container(monkeypatch, store)
+    p = FakeContainer()
+    _plant_claim(p, store)
+
+    p.fit(store, "UnseenPert", 0, steal=True)
+    assert p.is_trained(store, "UnseenPert", 0)
+
+
+def test_a_claim_older_than_the_ttl_is_reclaimed_without_a_flag(
+        isolated_checkpoints, monkeypatch, store_on_disk):
+    """A crashed run leaves a claim behind and nothing removes it. Requiring a
+    flag to get past that would make every crash a manual intervention."""
+    store = store_on_disk(n_bins=1)
+    _stub_container(monkeypatch, store)
+    p = FakeContainer()
+    _plant_claim(p, store, age_seconds=p._claim_ttl() + 60)
+
+    p.fit(store, "UnseenPert", 0)
+    assert p.is_trained(store, "UnseenPert", 0)
+
+
+def test_the_wipe_removes_a_stale_cache_but_not_the_claim(
+        isolated_checkpoints, monkeypatch, store_on_disk):
+    """The container wipes its run dir because GEARS silently reuses any
+    `processed_data/` it finds. It must not take the claim with it — that is how
+    a competitor's claim used to vanish mid-race — and it must cope with the
+    cache being a DIRECTORY, which a flat unlink loop does not."""
     store = store_on_disk(n_bins=1)
     _stub_container(monkeypatch, store)
     p = FakeContainer()
     run_dir = p._run_dir(store, "UnseenPert", 0)
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / CLAIM_FILE).write_text(json.dumps(
-        {"host": "other", "pid": 4242, "started_at": time.time()}))
+    (run_dir / "processed_data").mkdir()
+    (run_dir / "processed_data" / "cache.pkl").write_bytes(b"stale")
+    (run_dir / "leftover.txt").write_text("stale")
 
-    with pytest.raises(RuntimeError, match="already being trained"):
-        p.fit(store, "UnseenPert", 0)
-    p.fit(store, "UnseenPert", 0, force=True)        # --force overrides
+    seen = {}
+    real_clean = p._clean_run_dir
+
+    def spy(rd):
+        real_clean(rd)
+        seen["after_wipe"] = sorted(x.name for x in rd.iterdir())
+    monkeypatch.setattr(p, "_clean_run_dir", spy)
+
+    p.fit(store, "UnseenPert", 0)
+
+    assert seen["after_wipe"] == [CLAIM_FILE], seen["after_wipe"]
     assert p.is_trained(store, "UnseenPert", 0)
+
+
+def test_a_crashed_retrain_does_not_leave_a_dir_that_reports_itself_trained(
+        isolated_checkpoints, monkeypatch, store_on_disk):
+    """The template must retract the previous run's fingerprint before touching
+    its artefacts. Otherwise a crashed retrain leaves the OLD certificate over
+    NEW half-written weights: `is_trained` says yes, the next fit skips it, and
+    predict scores it. Asserted on the container tier as well as the torch tier
+    so the guarantee is shown to come from `fit`, not from the container's wipe.
+    """
+    store = store_on_disk(n_bins=1)
+    _stub_container(monkeypatch, store)
+    p = FakeContainer()
+    p.fit(store, "UnseenPert", 0)
+    assert p.is_trained(store, "UnseenPert", 0)
+
+    def boom(*a, **k):
+        raise RuntimeError("simulated OOM mid-training")
+    monkeypatch.setattr(p, "_train", boom)
+
+    with pytest.raises(RuntimeError, match="simulated OOM"):
+        p.fit(store, "UnseenPert", 0, force=True)
+
+    assert not p.is_trained(store, "UnseenPert", 0)
+    # WHY the refusal differs by tier: this tier wipes its run dir before
+    # training, so after a crash the artefacts are gone and that is what is
+    # reported. The torch tier keeps its dir, so there the retracted fingerprint
+    # is the thing that refuses (see `test_torch_predictor_e2e`). Either way the
+    # answer is no — which is the point: the guarantee is `fit`'s, and it does
+    # not depend on which tier happens to wipe.
+    assert "missing artefacts" in p.unusable_reason(store, "UnseenPert", 0)
 
 
 # ---------------------------------------------------------------------------

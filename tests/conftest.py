@@ -105,11 +105,22 @@ def fake_store():
 
 @pytest.fixture
 def isolated_checkpoints(tmp_path, monkeypatch):
-    """Send every checkpoint write to tmp_path.
+    """Send every write under `models/` to tmp_path.
 
-    `config.checkpoint_dir` reads `VCR_TRAINED_MODEL_ROOT` at call time, so a
-    test can redirect the whole tier's on-disk state and never touch the real
-    `models/` tree.
+    TWO levers, because one does not cover the other:
+
+    * `VCR_TRAINED_MODEL_ROOT` (read at call time by `config.checkpoint_dir`)
+      redirects the expensively-trained tier's checkpoints.
+    * `config.MODELS_DIR` is a module global that `predictor_dir` reads at call
+      time, so rebinding it redirects `predictor_dir` / `weights_path` /
+      `predictions_path` — i.e. the learned and analytical tiers.
+
+    Setting only the env var is what let a test delete a real
+    `models/<dataset>/Zero/` directory: the trained tier was safely redirected
+    and every other tier was still pointed at the repo. Same pattern as the
+    context manager in `perturb_dataset_analysis/cleaning_comparison.py`.
     """
+    import benchmark.config as bconfig
     monkeypatch.setenv("VCR_TRAINED_MODEL_ROOT", str(tmp_path))
+    monkeypatch.setattr(bconfig, "MODELS_DIR", tmp_path)
     return tmp_path

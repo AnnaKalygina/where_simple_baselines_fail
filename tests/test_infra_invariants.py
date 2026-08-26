@@ -11,11 +11,14 @@ from __future__ import annotations
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 
 PY = sys.executable
-REPO = "/cluster/work/boeva/virtual_cell_reasoning"
+#: Derived, not hardcoded — this file used to name the cluster path here while
+#: deriving it from `__file__` further down, so the suite only ran in one place.
+REPO = str(Path(__file__).resolve().parents[1])
 
 
 def _run_isolated(*parts: str) -> subprocess.CompletedProcess:
@@ -112,3 +115,81 @@ def test_every_registered_predictor_lands_in_a_known_category():
     known = {"analytical", "learned", "controls", "dl", "transformers"}
     got = set(eval(cats))
     assert got <= known, f"unexpected category (a class built oddly?): {got - known}"
+
+
+# ---------------------------------------------------------------------------
+# The recipes we actually ship
+# ---------------------------------------------------------------------------
+# The container e2e tests exercise a FakeContainer against a synthetic recipe, so
+# nothing checks the `docker/<model>/model.yaml` files that real runs read. A
+# malformed one is otherwise found at the top of a GPU job.
+
+
+def _shipped_container_predictors():
+    from benchmark.predictors.base import PREDICTOR_REGISTRY, _ensure_predictors_loaded
+    from benchmark.predictors.container_predictor import ContainerPredictor
+    _ensure_predictors_loaded()
+    return sorted(
+        (name, cls) for name, cls in PREDICTOR_REGISTRY.items()
+        if isinstance(cls, type) and issubclass(cls, ContainerPredictor))
+
+
+def test_there_is_at_least_one_shipped_container_model():
+    """Guards the parametrisation below: an empty registry would make every
+    recipe test vacuously pass."""
+    assert _shipped_container_predictors(), "no ContainerPredictor is registered"
+
+
+@pytest.mark.parametrize("name,cls", _shipped_container_predictors())
+def test_shipped_recipe_is_valid_and_usable(name, cls):
+    """Load each real `model.yaml` through the same validator `_recipe()` uses.
+
+    The .sif is deliberately NOT required to exist: a recipe is authored before
+    its image is built (PRESAGE's is), and tying this to the image would make the
+    check unrunnable exactly when it is most useful.
+    """
+    p = cls()
+    recipe = cls._recipe()                      # raises on missing/unknown keys
+
+    assert recipe["model_key"], f"{name}: empty model_key"
+    assert p.sif_path.startswith("docker/"), f"{name}: sif_path not repo-relative"
+    assert p.entry and p.entry[0] == "python", f"{name}: unexpected entry {p.entry}"
+    assert p.code_binds, f"{name}: no code_binds — the wrapper would not be mounted"
+    assert p.default_hyperparameters, f"{name}: no pinned hyperparameters"
+    assert p._expected_artifacts(), f"{name}: nothing distinguishes trained from empty"
+    assert p.train_timeout > 0 and p.predict_timeout > 0, f"{name}: non-positive timeout"
+
+    # extra_config validates its own values; calling it is the check.
+    assert isinstance(p.extra_config, dict)
+
+    # Artefact paths are run-dir-relative: an absolute one would escape the run
+    # dir and make two folds share state.
+    import os
+    bad = [a for a in p._expected_artifacts() if os.path.isabs(a)]
+    assert not bad, f"{name}: absolute expected_artifacts {bad}"
+
+
+@pytest.mark.parametrize("name,cls", _shipped_container_predictors())
+def test_shipped_code_binds_point_at_real_directories(name, cls):
+    """The wrapper is bind-mounted, not baked, so a typo'd path yields an empty
+    mount and a `ModuleNotFoundError` inside the container."""
+    repo = Path(REPO)
+    for src in cls._recipe()["code_binds"]:
+        assert (repo / src).is_dir(), f"{name}: code_bind source {src} is not a directory"
+        assert list((repo / src).glob("run_model.py")), \
+            f"{name}: {src} has no run_model.py — `entry` would have nothing to run"
+
+
+@pytest.mark.parametrize("name,cls", _shipped_container_predictors())
+def test_cell_aware_models_declare_at_least_one_cell_axis_regime(name, cls):
+    """And cell-blind ones do not: `cell_aware` and `scenarios` are two halves of
+    the same claim, and they drifting apart is how a cell-blind model ends up
+    scored on a cell-axis regime."""
+    from benchmark.predictors._container import leakage
+    cell_axis = set(cls.scenarios) & set(leakage.BIN_AXIS_REGIMES)
+    if cls.cell_aware:
+        assert cell_axis, f"{name}: cell_aware but declares no cell-axis regime"
+    else:
+        assert not cell_axis, (
+            f"{name}: declares cell-axis regime(s) {sorted(cell_axis)} while "
+            f"cell_aware=False — it cannot condition on the covariate")

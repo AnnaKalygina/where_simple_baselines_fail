@@ -75,13 +75,20 @@ on the predictor class, NOT here — `verify` reads them in a pyyaml-less env.
 the run dir as `train_config.json` / `predict_config.json`, so a predict run no
 longer overwrites the record of how training was configured. Nothing in the
 container changes.)*
+
+> **Changed 2026-08-26 — `regime` is GONE.** It was emitted as a verbatim copy of
+> `scenario` and read by no wrapper; the schema now rejects nothing but no longer
+> requires it. **Use `scenario`.** A wrapper that still sends `regime` is not
+> broken — it falls through to the model-specific extras rule and must simply be
+> a JSON scalar — but nothing will populate it. This is the same defect as the
+> `covariate_field`/`covariate_key` pair collapsed by F4: a duplicated field is a
+> field that can silently disagree with the one that matters.
 ```jsonc
 {
   "mode": "train",
   "model": "gears",
   "dataset": "adamson16",
   "scenario": "UnseenPert",           // PascalCase-native
-  "regime":   "UnseenPert",           // == scenario; explicit provenance
   "fold": 0,
   "seed": 42,                          // drives all RNGs + the GEARS custom split
   "data_path": "/data/adamson16_processed.h5ad",  // ONE combined h5ad (host path in; rewritten to /data/…)

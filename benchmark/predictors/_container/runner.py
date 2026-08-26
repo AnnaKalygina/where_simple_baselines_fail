@@ -132,7 +132,7 @@ def _demo() -> None:
     cmd_t, _ = run_container(
         "docker/gears/gears.sif", "train",
         {"model": "gears", "dataset": "adamson16", "scenario": "UnseenPert", "fold": 0,
-         "seed": 42, "regime": "UnseenPert",
+         "seed": 42,
          "data_path": "/host/data/adamson16/adamson16_processed.h5ad",
          "split_name": "split_UnseenPert_fold_0", "covariate_key": "cell_type",
          "train_conditions": ["AARS"], "val_conditions": ["BRCA1"],

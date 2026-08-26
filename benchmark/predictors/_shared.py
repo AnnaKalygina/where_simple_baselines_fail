@@ -4,7 +4,7 @@ Kept here (not duplicated per predictor, and not hosted inside any one predictor
 module) so a single fix propagates and the dependency arrows stay clean:
 
     config / data_loader  ->  base / _shared  ->  {analytical, controls,
-                                                   dl_adapter, learned}
+                                                   learned, trained}
 
 Everything here is predictor-agnostic: split-index resolution, output-shape
 computation, masked reductions over a (n_bins, n_kos) grid, combo-pair

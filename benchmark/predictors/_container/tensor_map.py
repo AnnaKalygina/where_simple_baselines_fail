@@ -15,10 +15,10 @@ pseudobulk of those cells. Either way the benchmark sees the same thing — the
 mean absolute profile per cell, minus control. The container's prediction
 *space* only changes how many rows arrive; the reduction is identical.
 
-The three mapping primitives are **preserved verbatim** from the (to-be-removed)
-``benchmark.predictors.dl_adapter``/``_fold_align`` path so this keeps working
-after that machinery is deleted (see ``TRAINING_INFRA_PLAN.md`` §Decommissioning
-& §Engineering-quality commitments #1):
+The three mapping primitives were **preserved verbatim** from the adopted-DL
+path (``dl_adapter.py`` / ``_fold_align.py``) so this kept working after that
+machinery was deleted. It now is: those modules are gone, and the copies below
+are the only remaining implementations.
   * ``normalize_combo_label`` — collapses the DL '+N'/'_N' guide encoding so a
     model's ``FDPS+HUS1+2`` matches our ``FDPS+HUS1_2`` (no-op for single genes).
   * gene-set **intersection** by symbol — genes the model doesn't predict stay
@@ -39,8 +39,8 @@ _DEGENERATE_COV = {"", "none", "None", "nan", "NaN", "NOTHING", "nothing"}
 
 
 def normalize_combo_label(c: str) -> str:
-    """Guide-resolved canonical key for a (combo) condition — PRESERVED verbatim
-    from ``benchmark._fold_align.normalize_combo_label``.
+    """Guide-resolved canonical key for a (combo) condition — preserved verbatim
+    from the deleted ``benchmark._fold_align.normalize_combo_label``.
 
     The DL prediction h5ads write per-guide suffixes with '+' (the same char as
     the combo separator): our 'FDPS+HUS1_2' / 'FDPS_2+HUS1_2' appear as
@@ -78,7 +78,8 @@ def map_predictions_to_delta_tensor(adata, store, scenario: str, fold: int, *,
     """Reduce a container's ``predictions.h5ad`` (``adata``) to the benchmark's
     ``(n_test_bins, n_test_kos, n_genes)`` delta tensor for ``(scenario, fold)``.
 
-    Faithful port of the proven ``DLAdapter.predict`` mapping. Unmatched
+    Faithful port of the ``DLAdapter.predict`` mapping, validated against it
+    while that tier existed; the original has since been deleted. Unmatched
     ``(bin, ko)`` cells and un-predicted genes are left NaN (skipped by metrics).
     """
     split = store.split(scenario, fold)
