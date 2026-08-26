@@ -34,7 +34,7 @@ import pandas as pd
 from benchmark.config import (
     DATASET_CONFIG, RESULTS_DIR,
     enumerate_jobs, existing_predictions_path, predictions_path, predictor_dir,
-    weights_path, results_fold_dir, results_pooled_dir,
+    results_fold_dir, results_pooled_dir,
 )
 from benchmark.data_loader import DatasetStore
 from benchmark.meta_metrics import (
@@ -44,7 +44,9 @@ from benchmark.meta_metrics import (
     main_benchmark_metrics, summarize_meta_metric,
     summarize_metric_distributions,
 )
-from benchmark.predictors.base import PREDICTOR_REGISTRY, get_predictor
+from benchmark.predictors.base import (
+    PREDICTOR_REGISTRY, get_predictor, _ensure_predictors_loaded, predictor_category)
+from benchmark.predictors.learned import LearnedPredictor
 
 log = logging.getLogger(__name__)
 
@@ -100,25 +102,18 @@ def _file_lock(path: Path) -> Iterator[None]:
         os.close(fd)
 
 
-PREDICTOR_CATEGORIES = {
-    "analytical": [
-        "Zero", "Mean-over-perturbations", "Mean-over-cell-types",
-        "Mean-over-perturbations-and-cell-types", "Two-way-mean",
-        "Additive", "Matching-mean", "Scaled-delta", "TargetZero",
-    ],
-    "learned": [
-        "Ridge", "LinearAdditive", "LatentAdditive", "BilinearRidge",
-        "Correlation", "TargetScaling", "Mean+TargetScaling", "GlobalEpistasis",
-    ],
-    "controls": ["Tech-duplicate", "Interp-duplicate"],
-    "dl": ["scGPT", "GEARS", "PRESAGE"],
-    # Adopted depth_hypothesis transformer variants (ecoli_synthetic only).
-    "transformers": [
-        "transformer_12x1", "transformer_6x2", "transformer_6x1",
-        "transformer_4x3", "transformer_4x1", "transformer_3x4",
-        "transformer_3x1", "transformer_2x6", "transformer_2x1",
-    ],
-}
+def predictor_categories() -> Dict[str, List[str]]:
+    """category -> sorted predictor names, derived from the registry.
+
+    Replaces a hand-maintained table that had already drifted: it listed
+    scGPT/GEARS/PRESAGE under "dl" but not GEARS-ct, so `--predictor dl`
+    silently skipped the container model.
+    """
+    _ensure_predictors_loaded()
+    cats: Dict[str, List[str]] = {}
+    for name, cls in PREDICTOR_REGISTRY.items():
+        cats.setdefault(predictor_category(cls), []).append(name)
+    return {k: sorted(v) for k, v in cats.items()}
 
 
 # ===================================================================
@@ -178,18 +173,17 @@ def _resolve_folds(spec: str, dataset: str, scenario: str) -> List[int]:
 
 
 def _resolve_predictors(spec: str) -> List[str]:
-    # Trigger eager registration
-    from benchmark.predictors import (  # noqa: F401
-        analytical, learned, controls, dl_adapter, transformers, container_predictor)
+    _ensure_predictors_loaded()
     if spec == "all":
         return sorted(PREDICTOR_REGISTRY.keys())
+    categories = predictor_categories()
     out: Set[str] = set()
     for token in spec.split(","):
         token = token.strip()
         if not token:
             continue
-        if token in PREDICTOR_CATEGORIES:
-            out.update(PREDICTOR_CATEGORIES[token])
+        if token in categories:
+            out.update(categories[token])
         elif token in PREDICTOR_REGISTRY:
             out.add(token)
         else:
@@ -225,6 +219,40 @@ def _resolve_job_tuples(
 # ===================================================================
 # Subcommand implementations
 # ===================================================================
+
+
+def cmd_roster(args) -> None:
+    """Print the predictor roster — the single derived answer to "what exists".
+
+    Everything here is read off the classes, so it cannot drift from the code
+    the way the old hand-kept category table did. `--json` for tooling.
+    """
+    _ensure_predictors_loaded()
+    rows = []
+    for name in sorted(PREDICTOR_REGISTRY):
+        cls = PREDICTOR_REGISTRY[name]
+        rows.append({
+            "name": name,
+            "category": predictor_category(cls),
+            "module": cls.__module__.rsplit(".", 1)[-1],
+            "needs_training": bool(cls.needs_training),
+            "has_drop_rule": bool(cls.has_drop_rule),
+            "scenarios": list(cls.scenarios),
+            **({"cell_aware": bool(cls.cell_aware)}
+               if hasattr(cls, "cell_aware") else {}),
+        })
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2))
+        return
+    w = max(len(r["name"]) for r in rows)
+    print(f"{'predictor'.ljust(w)}  {'category':12s} {'trains':6s} {'drop':4s} scenarios")
+    for r in rows:
+        print(f"{r['name'].ljust(w)}  {r['category']:12s} "
+              f"{'yes' if r['needs_training'] else '-':6s} "
+              f"{'yes' if r['has_drop_rule'] else '-':4s} {','.join(r['scenarios'])}")
+    print(f"\n{len(rows)} predictors")
+    for cat, names in sorted(predictor_categories().items()):
+        print(f"  {cat:12s} {len(names)}")
 
 
 def cmd_list(args) -> None:
@@ -285,9 +313,13 @@ def cmd_fit(args) -> None:
             if sc not in cls.scenarios:
                 log.info("skip %s/%s/fold%d %s (not in scenarios)", ds, sc, fold, p)
                 continue
-            wpath = weights_path(ds, p, sc, fold)
-            log.info("FIT %s/%s/fold%d %s -> %s", ds, sc, fold, p, wpath)
             model = cls()
+            if (cls.needs_training and not getattr(args, "force", False)
+                    and model.is_trained(store, sc, fold)):
+                log.info("FIT %s/%s/fold%d %s: trained state already present — "
+                         "skipping (--force to redo)", ds, sc, fold, p)
+                continue
+            log.info("FIT %s/%s/fold%d %s", ds, sc, fold, p)
             try:
                 model.fit(store, sc, fold)
             except FileNotFoundError as e:
@@ -296,7 +328,12 @@ def cmd_fit(args) -> None:
                 log.warning("FIT %s/%s/fold%d %s: skipping — %s",
                             ds, sc, fold, p, e)
                 continue
-            model.save_weights(wpath)
+            # Each tier owns its own persistence: the learned tier writes a
+            # weights.npz here, container predictors already wrote their run dir
+            # inside fit(), and analytical baselines have nothing to persist.
+            if isinstance(model, LearnedPredictor):
+                log.info("FIT %s/%s/fold%d %s -> %s", ds, sc, fold, p,
+                         model.persist(store, sc, fold))
 
 
 def cmd_predict(args) -> None:
@@ -309,20 +346,16 @@ def cmd_predict(args) -> None:
                 continue
             ppath = predictions_path(ds, p, sc, fold)
             log.info("PREDICT %s/%s/fold%d %s -> %s", ds, sc, fold, p, ppath)
-            # Load weights if they exist (learned/DL); else fresh-instantiate.
-            wpath = weights_path(ds, p, sc, fold)
-            if cls.needs_training and wpath.exists():
-                model = cls.load_weights(wpath)
-            else:
-                model = cls()
-                if cls.needs_training:
-                    try:
-                        model.fit(store, sc, fold)
-                    except FileNotFoundError as e:
-                        log.warning("PREDICT %s/%s/fold%d %s: skipping — %s",
-                                    ds, sc, fold, p, e)
-                        continue
-                    model.save_weights(wpath)
+            # predict NEVER trains. A predictor that has not been fitted for this
+            # fold is skipped with a clear message; previously a stale/empty
+            # weights.npz made this branch either retrain silently or crash.
+            model = cls()
+            if cls.needs_training and not model.is_trained(store, sc, fold):
+                log.warning("PREDICT %s/%s/fold%d %s: not trained — run `fit` "
+                            "(or `all`) first; skipping", ds, sc, fold, p)
+                continue
+            if isinstance(model, LearnedPredictor):
+                model = cls.restore(store, sc, fold)
             try:
                 preds = model.predict(store, sc, fold)
             except FileNotFoundError as e:
@@ -498,9 +531,7 @@ def _resolve_baselines(args) -> List[Optional[str]]:
     spec = getattr(args, "baseline_predictor", None)
     if not spec:
         return [None]
-    # Trigger eager predictor registration before validating names.
-    from benchmark.predictors import (  # noqa: F401
-        analytical, learned, controls, dl_adapter, transformers, container_predictor)
+    _ensure_predictors_loaded()      # register before validating names
     out: List[Optional[str]] = []
     for tok in spec.split(","):
         tok = tok.strip()
@@ -695,20 +726,30 @@ def build_parser() -> argparse.ArgumentParser:
         ("cf",      cmd_cf,      True,  True,  True),
         ("all",     cmd_all,     True,  True,  False),
         ("list",    cmd_list,    True,  False, False),
+        ("roster",  cmd_roster,  False, False, False),
         ("verify",  cmd_verify,  False, False, False),
     ]:
         ssp = sub.add_parser(name)
-        _add_selector_args(ssp, with_predictor, with_metric, with_filters)
+        if name != "roster":     # the roster is a property of the code, not of a dataset
+            _add_selector_args(ssp, with_predictor, with_metric, with_filters)
         if name in {"bs", "cf"}:
             ssp.add_argument("--baseline-predictor", default=None,
                               help="registered predictor name, or a comma-list of them "
                                    "(compared in one run, distinguished by the "
                                    "baseline_predictor column); defaults to scenario default")
+        if name in {"fit", "all"}:
+            ssp.add_argument("--force", action="store_true",
+                             help="retrain even if this fold is already trained "
+                                  "(default: skip; for container predictors this also "
+                                  "re-runs the expensive GPU training and wipes the run dir)")
         if name in {"fit", "all", "predict"}:
             ssp.add_argument("--no-verify", action="store_true",
                              help="skip verify gates: for fit/all the pre-benchmark L0+L1 "
                                   "preflight; for predict the DL adoption fold-alignment gate "
                                   "(otherwise a misaligned DL fold is refused, not written)")
+        if name == "roster":
+            ssp.add_argument("--json", action="store_true",
+                             help="emit the roster as JSON for tooling")
         if name == "verify":
             ssp.add_argument("--full", action="store_true",
                              help="also run L3 (GT-axis) + L6 (fold alignment); needs saved "

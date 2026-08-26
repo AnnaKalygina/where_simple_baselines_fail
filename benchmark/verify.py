@@ -1530,6 +1530,19 @@ CONTRACTS: Dict[str, Callable] = {
     "Tech-duplicate": _c_techdup,
     "Interp-duplicate": _c_interp,
 }
+def _is_expensively_trained(cls) -> bool:
+    """Is this predictor's training too expensive to run in a contract test?
+
+    True for the container and torch tiers — training means a GPU run, so there
+    is no in-codebase logic to exercise against a synthetic store. Imported
+    lazily: `verify` must stay importable in environments where the predictor
+    stack is heavier than the verifier needs.
+    """
+    from benchmark.predictors.container_predictor import ContainerPredictor
+    from benchmark.predictors.torch_predictor import TorchPredictor
+    return issubclass(cls, (ContainerPredictor, TorchPredictor))
+
+
 def _dl_model_key_map() -> Dict[str, str]:
     """{display_name: MANIFEST.json model_key} for the DL adapters, read straight
     from the predictor registry (DLAdapter subclasses already set ``model_key``).
@@ -1566,15 +1579,16 @@ def verify_predictor_contracts(r: Results) -> None:
             r.check(f"contract {fn.__name__}", False, f"{type(e).__name__}: {e}")
     _c_target_errors(r)
     _c_missing_genes(r)
-    # Meta-check: every registered non-DL, non-adopted predictor must have a
-    # contract. DL adapters (model_key), adopted-external predictors (is_adopted,
-    # e.g. the depth_hypothesis transformers), and container-trained DL predictors
-    # (is_container_trained, e.g. GEARS-ct — logic runs in the .sif) implement no
-    # in-codebase logic to contract-test on synthetic data, so they are exempt.
+    # Meta-check: every registered predictor whose logic IS in-codebase must have
+    # a contract. Exempt are the ones whose logic cannot be exercised on a
+    # synthetic store: DL adapters (predictions computed elsewhere) and the
+    # expensively-trained tiers, whose "logic" is GPU-hours of training —
+    # container predictors run it inside a .sif, torch predictors in-process.
+    # Derived from the class, not declared, so a new predictor cannot arrive with
+    # a stale flag and quietly skip the check.
     missing = [n for n, c in PREDICTOR_REGISTRY.items()
                if n not in CONTRACTS and n not in _dl_model_key_map()
-               and not getattr(c, "is_adopted", False)
-               and not getattr(c, "is_container_trained", False)]
+               and not _is_expensively_trained(c)]
     r.check("contract suite covers every non-DL predictor", not missing,
             f"uncontracted: {missing}" if missing else "")
 

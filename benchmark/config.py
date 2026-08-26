@@ -190,6 +190,27 @@ def weights_path(
     return predictor_dir(dataset, predictor, scenario, fold) / "weights.npz"
 
 
+def checkpoint_dir(
+    dataset: str, predictor: str, scenario: str, fold: int,
+) -> Path:
+    """Where an expensively-trained predictor keeps its run state.
+
+    Sits beside that fold's `predictions.npz` so one run is one directory:
+    `models/{dataset}/{predictor}/{scenario}/fold{N}/checkpoint/`.
+
+    Resolved HERE, not inside a predictor, so every caller — the CLI, verify,
+    lifecycle tooling — finds the same path. `VCR_TRAINED_MODEL_ROOT` relocates
+    the heavy artefacts (they are GBs, and this volume runs full) while the
+    small scored outputs stay in the repo tree; it is read once, in this
+    function, rather than being a per-predictor branch that bypasses
+    `predictor_dir` and leaves the checkpoint unfindable by anything else.
+    """
+    root = os.environ.get("VCR_TRAINED_MODEL_ROOT")
+    if root:
+        return Path(root) / dataset / predictor / scenario / f"fold{fold}"
+    return predictor_dir(dataset, predictor, scenario, fold) / "checkpoint"
+
+
 def results_fold_dir(dataset: str, scenario: str, fold: int) -> Path:
     """Results directory for per-fold metric CSVs (long format)."""
     return RESULTS_DIR / dataset / scenario / f"fold{fold}"

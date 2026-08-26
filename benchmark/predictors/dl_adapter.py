@@ -17,7 +17,6 @@ that still import them from this module.
 """
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Dict, Tuple
@@ -192,20 +191,18 @@ class DLAdapter(Predictor):
             scenario=scenario, model=self.model_key,
             declared=declared, h5ad_fold=h5ad_fold, covered=covered, vocab=vocab)
 
-    def save_weights(self, path):
-        """Save a pointer file — actual weights live elsewhere."""
-        path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
-        # Tuple keys (ds, sc, fold) are not JSON-serializable; encode as "ds|sc|fold".
-        ptr = {"|".join(str(p) for p in k): str(v)
-               for k, v in self._predictions_cache.items()}
-        np.savez(str(path), pointer=np.array(json.dumps(ptr)))
+    def is_trained(self, store, scenario, fold) -> bool:
+        """Do this fold's externally-trained predictions actually resolve?
 
-    @classmethod
-    def load_weights(cls, path):
-        # DL "weights" are only a pointer to the external predictions h5ad; the
-        # prediction-path cache is re-resolved from the manifest on demand in
-        # fit()/predict(), so a fresh instance is all that's needed.
-        return cls()
+        These models are trained OUTSIDE this codebase, so "trained" means the
+        MANIFEST maps this canonical fold to a predictions h5ad that exists.
+        Returning a blanket True would make `fit` report "already trained" for a
+        fold whose manifest entry is missing, hiding the error until predict."""
+        try:
+            self._load_predictions_h5ad(store, scenario, fold)
+            return True
+        except FileNotFoundError:
+            return False
 
 
 # ===================================================================

@@ -1,0 +1,77 @@
+# GEARS training/inference container — pinned Singularity definition (ENV ONLY).
+#
+# Design: this image holds ONLY the frozen environment (pytorch base + GEARS +
+# scanpy stack). Our thin code (run_model.py, gears_wrapper.py — which inlines its
+# own data-load shim) and gene2go_all.pkl are NOT baked in — they are BIND-MOUNTED
+# from the host repo at run time by benchmark/predictors/_container/runner.py (under
+# /app_code/gears). This removes
+# all build-time file staging and lets us edit the wrapper without a rebuild.
+#
+# PINS (resolved 2026-08-10; see BUILD_ENV.md):
+#   base   pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime
+#          @ sha256:831247999fbf7e08f61b3e39f6d77ee434f38f6f07f769d00db451e853878067
+#   GEARS  github.com/millerh1/GEARS.git @ e6b6d6cb9080348fe121234082c9958cf9f17eae
+#
+# BUILD on the ETH CustomApps client (has --fakeroot + internet; see BUILD_ENV.md).
+# The slim def needs NO local files, so just paste it there and build:
+#   cd /cluster/customapps/biomed/boeva/akalygina/singularity/gears
+#   singularity build --fakeroot gears.sif gears.def
+# The sif then appears read-only on LeoMed at the same /cluster/customapps path.
+
+Bootstrap: docker
+From: pytorch/pytorch@sha256:831247999fbf7e08f61b3e39f6d77ee434f38f6f07f769d00db451e853878067
+
+%post
+    set -e
+    apt-get update && apt-get install -y --no-install-recommends git wget \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Python deps (same set as the atheus reference; torch/cuda come from the base
+    # image). No cellsimbench, no ipdb.
+    pip install --no-cache-dir \
+        torch-geometric \
+        scanpy \
+        "anndata>=0.12.0" \
+        pandas \
+        numpy \
+        scikit-learn \
+        tqdm \
+        omegaconf \
+        hydra-core \
+        wandb
+
+    # GEARS fork, pinned by commit SHA. NO --force-reinstall on purpose: GEARS lists
+    # an UNPINNED `torch` dependency, and --force-reinstall upgrades the base image's
+    # pinned torch 2.5.1+cu121 to the latest CUDA-13 torch — defeating the base-digest
+    # pin and risking GPU-driver incompatibility on LeoMed. Plain install keeps the
+    # already-satisfied torch 2.5.1+cu121.
+    pip install --no-cache-dir \
+        "git+https://github.com/millerh1/GEARS.git@e6b6d6cb9080348fe121234082c9958cf9f17eae"
+
+    # Capture the exact resolved versions as a lockfile for reproducible rebuilds.
+    pip freeze > /opt/gears_lockfile.txt
+    echo "gears_lockfile written to /opt/gears_lockfile.txt"
+
+%environment
+    export PYTHONUNBUFFERED=1
+
+%runscript
+    # Generic entry: run whatever host-mounted script the runner passes as argv.
+    exec python "$@"
+
+%labels
+    org.vcr.model gears
+    org.vcr.base_digest sha256:831247999fbf7e08f61b3e39f6d77ee434f38f6f07f769d00db451e853878067
+    org.vcr.gears_commit e6b6d6cb9080348fe121234082c9958cf9f17eae
+    org.vcr.contract combined-form; code + gene2go bind-mounted at /app_code
+
+%help
+    GEARS perturbation-prediction container — ENVIRONMENT ONLY.
+    Our code + gene2go are bind-mounted from the host at run time by
+    benchmark/predictors/_container/runner.py, e.g.:
+        singularity exec --nv \
+          --bind <repo>/docker/gears:/app_code/gears:ro \
+          --bind <data>:/data:ro --bind <cfg>:/config.json:ro --bind <out>:/model_output \
+          --env PYTHONPATH=/app_code/gears \
+          gears.sif python /app_code/gears/run_model.py {train|predict} /config.json
+    Config schema: docker/CONTRACT.md. No cellsimbench dependency.
