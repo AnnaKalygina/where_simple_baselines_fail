@@ -73,12 +73,6 @@ class Predictor(ABC):
     # True for predictors with a per-target drop rule (cover < all perts is OK).
     # The verifier derives its coverage invariant from this attribute.
     has_drop_rule: bool = False
-    # True for predictors trained + inferred inside an external container (the DL
-    # ContainerPredictors, e.g. GEARS-ct): their logic runs in the .sif, not
-    # in-codebase, so — like the DL adapters — they carry no synthetic L4 contract
-    # and the verifier exempts them from the "every non-DL predictor has a contract"
-    # meta-check. Their real invariant is the L6b saved-.npz test-set check.
-    is_container_trained: bool = False
 
     # -----------------------------------------------------------------
     # Methods subclasses implement

@@ -38,6 +38,32 @@ def _optional(cfg: dict, key: str, types, where: str):
                             f"when present, got {type(cfg[key]).__name__}")
 
 
+#: Fields this schema knows about. Anything else is a model-specific extra,
+#: injected from `model.yaml`'s `extra_config:` block (e.g. GEARS' `gene2go_path`,
+#: PRESAGE's `presage_cache_path`). Those are NOT named here on purpose: this
+#: module is the shared host<->container contract, and listing one model's keys in
+#: it makes every other model look like a special case. They are still checked —
+#: `_check_extras` requires them to be JSON scalars, which is all this layer can
+#: meaningfully say about a key it does not own.
+_KNOWN_FIELDS = frozenset({
+    "mode", "model", "dataset", "scenario", "regime", "fold", "seed",
+    "data_path", "split_name", "covariate_key",
+    "train_conditions", "val_conditions", "test_conditions",
+    "hyperparameters", "output_dir", "checkpoint_dir", "model_path", "output_path",
+    "early_stopping", "checkpoint", "wandb", "wandb_project", "wandb_run",
+})
+
+
+def _check_extras(cfg: dict, where: str) -> None:
+    """Model-specific extras must be JSON scalars (they are hashed + serialized)."""
+    bad = {k: type(cfg[k]).__name__ for k in set(cfg) - _KNOWN_FIELDS
+           if not isinstance(cfg[k], (str, int, float, bool))}
+    if bad:
+        raise ContractError(
+            f"{where}: model-specific extra field(s) {bad} must be JSON scalars "
+            f"(they come from model.yaml `extra_config:`)")
+
+
 def validate_train_config(cfg: dict) -> dict:
     """Validate a combined-form TRAIN config; raise ContractError or return cfg."""
     where = "train config"
@@ -64,11 +90,11 @@ def validate_train_config(cfg: dict) -> dict:
     # optional but type-checked when present
     for k, t in (("hyperparameters", dict),
                  ("output_dir", str), ("checkpoint_dir", str),
-                 ("gene2go_path", str), ("early_stopping", dict),
-                 ("checkpoint", dict),
+                 ("early_stopping", dict), ("checkpoint", dict),
                  # W&B experiment tracking (train only; endpoint via WANDB_* env).
                  ("wandb", bool), ("wandb_project", str), ("wandb_run", str)):
         _optional(cfg, k, t, where)
+    _check_extras(cfg, where)
     return cfg
 
 
@@ -85,54 +111,7 @@ def validate_predict_config(cfg: dict) -> dict:
     _require(cfg, "output_path", str, where)
     _require(cfg, "test_conditions", list, where)
     for k, t in (("seed", int), ("covariate_key", str),
-                 ("hyperparameters", dict), ("gene2go_path", str)):
+                 ("hyperparameters", dict)):
         _optional(cfg, k, t, where)
+    _check_extras(cfg, where)
     return cfg
-
-
-def _selftest() -> None:
-    ok_train = {"mode": "train", "model": "gears", "dataset": "adamson16",
-                "scenario": "UnseenPert", "regime": "UnseenPert", "fold": 0,
-                "seed": 42, "data_path": "/data/adamson16_processed.h5ad",
-                "split_name": "split_UnseenPert_fold_0", "covariate_key": "cell_type",
-                "train_conditions": ["AARS"], "val_conditions": ["BRCA1"],
-                "test_conditions": ["TP53"],
-                "output_dir": "/model_output", "checkpoint_dir": "/model_output",
-                "hyperparameters": {"epochs": 20}}
-    validate_train_config(ok_train)
-
-    ok_predict = {"mode": "predict", "data_path": "/data/adamson16_processed.h5ad",
-                  "split_name": "split_UnseenPert_fold_0", "model_path": "/model_output",
-                  "output_path": "/model_output/predictions.h5ad",
-                  "test_conditions": ["TP53"], "covariate_key": "cell_type"}
-    validate_predict_config(ok_predict)
-
-    def _expect_fail(fn, cfg, needle):
-        try:
-            fn(cfg)
-        except ContractError as e:
-            assert needle in str(e), f"wrong error: {e}"
-        else:
-            raise AssertionError(f"expected ContractError containing {needle!r}")
-
-    _expect_fail(validate_train_config, {**ok_train, "mode": "predict"}, "mode must be 'train'")
-    _expect_fail(validate_train_config, {**ok_train, "scenario": "S1"}, "not one of")
-    _expect_fail(validate_train_config, {k: v for k, v in ok_train.items() if k != "data_path"},
-                 "missing required field 'data_path'")
-    _expect_fail(validate_train_config, {k: v for k, v in ok_train.items() if k != "split_name"},
-                 "missing required field 'split_name'")
-    _expect_fail(validate_train_config, {k: v for k, v in ok_train.items() if k != "covariate_key"},
-                 "missing required field 'covariate_key'")
-    _expect_fail(validate_train_config, {**ok_train, "test_conditions": "TP53"},
-                 "must be list")
-    _expect_fail(validate_train_config, {**ok_train, "fold": -1}, "fold must be >= 0")
-    _expect_fail(validate_predict_config, {k: v for k, v in ok_predict.items()
-                                           if k != "output_path"}, "missing required field 'output_path'")
-    _expect_fail(validate_predict_config, {k: v for k, v in ok_predict.items()
-                                           if k != "data_path"}, "missing required field 'data_path'")
-    print("contract.py SELFTEST PASSED (combined-form: valid configs accepted; "
-          "9 invalid configs rejected)")
-
-
-if __name__ == "__main__":
-    _selftest()

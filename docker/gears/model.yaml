@@ -9,7 +9,8 @@ sif_path: docker/gears/gears.sif                    # repo-relative; resolved vi
 entry: [python, /app_code/gears/run_model.py]       # argv run via `singularity exec`
 code_binds:                                          # host dir -> in-container mount (env-only sif; code bind-mounted)
   docker/gears: /app_code/gears                      # wrapper inlines its data-load shim → no separate harness bind
-gene2go_path: /app_code/gears/gene2go_all.pkl        # in-container path (bind-mounted); injected into config.json
+extra_config:                                        # model-specific keys injected verbatim into config.json
+  gene2go_path: /app_code/gears/gene2go_all.pkl      # in-container path (bind-mounted)
 wandb_project: vcr-gears-ct                          # self-hosted W&B (train only; endpoint via WANDB_* env)
 
 # Hard ceilings, in seconds. Required: without them a wedged container holds a

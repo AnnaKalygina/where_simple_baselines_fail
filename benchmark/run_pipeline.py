@@ -45,7 +45,7 @@ from benchmark.meta_metrics import (
     summarize_metric_distributions,
 )
 from benchmark.predictors.base import (
-    PREDICTOR_REGISTRY, get_predictor, _ensure_predictors_loaded, predictor_category)
+    PREDICTOR_REGISTRY, _ensure_predictors_loaded, predictor_category)
 from benchmark.predictors.learned import LearnedPredictor
 from benchmark.predictors.trained import TrainedPredictor
 

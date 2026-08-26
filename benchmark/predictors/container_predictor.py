@@ -71,7 +71,6 @@ class ContainerPredictor(TrainedPredictor):
     """
 
     needs_training = True
-    is_container_trained = True  # logic runs in the .sif → exempt from the L4 synthetic-contract meta-check
     # subclass-provided capability declaration (plain Python, read by verify):
     model_dir: str = ""          # repo-relative dir holding this model's model.yaml
 
@@ -138,11 +137,27 @@ class ContainerPredictor(TrainedPredictor):
 
     @property
     def extra_config(self) -> Dict:
-        """Model-specific keys injected into the container ``config.json``."""
-        recipe = self._recipe()
-        extra: Dict = {}
-        if recipe.get("gene2go_path"):
-            extra["gene2go_path"] = recipe["gene2go_path"]
+        """Model-specific keys injected verbatim into the container ``config.json``.
+
+        Declared as one ``extra_config:`` mapping in ``model.yaml`` rather than as
+        named top-level recipe keys. That matters now that unknown recipe keys are
+        an error (:func:`_validate_recipe`): naming them individually would grow
+        ``_OPTIONAL_RECIPE_KEYS`` into a union of every model's private vocabulary
+        — GEARS' ``gene2go_path``, PRESAGE's ``presage_cache_path``, scGPT's next —
+        and the "closed schema" would mean nothing. One escape hatch instead, so
+        the schema above it stays genuinely closed.
+
+        Values must be JSON scalars: this dict is hashed into the run fingerprint
+        (``_recipe_fingerprint``) and written into ``config.json``, so a nested or
+        unserialisable value fails late and confusingly.
+        """
+        extra = dict(self._recipe().get("extra_config") or {})
+        bad = {k: type(v).__name__ for k, v in extra.items()
+               if not isinstance(v, (str, int, float, bool))}
+        if bad:
+            raise ValueError(
+                f"{self.name}: model.yaml extra_config values must be JSON scalars; "
+                f"got {bad}")
         return extra
 
     # -------- paths --------
@@ -195,6 +210,26 @@ class ContainerPredictor(TrainedPredictor):
             problems.append("no control cells (condition ∈ {control,ctrl,ctrl_iegfp})")
         elif not (ctrl_mask & (split == "train")).any():
             problems.append("no control cell labelled 'train' — basal starved")
+
+        # The covariate column is ASSUMED throughout (_container/config.py always
+        # sends `covariate_key=cell_type`, leakage.py checks pairs on it). For a
+        # cell-blind model a missing column is cosmetic; for a `cell_aware` one it
+        # is not — the container falls back to a degenerate covariate and the model
+        # quietly stops conditioning while still producing cell-axis numbers. So
+        # the strength of the check follows the claim.
+        if COVARIATE_COLUMN not in obs.columns:
+            msg = f"obs has no {COVARIATE_COLUMN!r} column"
+            if self.cell_aware:
+                problems.append(msg + " — a cell_aware model cannot condition on it")
+            else:
+                log.warning("%s: %s (model is not cell_aware; continuing)", self.name, msg)
+        elif self.cell_aware and scenario in leakage.BIN_AXIS_REGIMES:
+            n_cov = obs[COVARIATE_COLUMN].astype(str).nunique()
+            if n_cov < 2:
+                problems.append(
+                    f"{COVARIATE_COLUMN!r} has {n_cov} distinct value(s) — a "
+                    f"cell-axis regime ({scenario}) needs ≥2, and the wrapper "
+                    f"silently disables covariate conditioning below that")
 
         # U5: split tokens must include train/val/test.
         tokens = set(split.unique())
@@ -279,7 +314,7 @@ class ContainerPredictor(TrainedPredictor):
         return run_dir
 
     def _train(self, store: DatasetStore, scenario: str, fold: int,
-               run_dir: Path) -> None:
+               run_dir: Path) -> Optional[Dict]:
         cfg = _config.build_config(
             "train", dataset=store.dataset, scenario=scenario, fold=fold,
             model_name=self.model_yaml_key, seed=self.seed,
@@ -296,6 +331,16 @@ class ContainerPredictor(TrainedPredictor):
             self._sif(), "train", cfg, data_dir=self._data_dir(store),
             output_dir=run_dir, code_binds=self._code_binds(), entry=self.entry,
             timeout=self.train_timeout)
+        return self._train_report(run_dir)
+
+    def _train_report(self, run_dir: Path) -> Optional[Dict]:
+        """Training provenance the container left behind, for ``fingerprint.json``.
+
+        Default None: a container that records nothing is not an error. Subclasses
+        that do (best epoch, val loss, what was held out) lift it here — see
+        :class:`PRESAGEContainer`.
+        """
+        return None
 
     def _infer(self, store: DatasetStore, scenario: str, fold: int,
                run_dir: Path) -> np.ndarray:
@@ -378,7 +423,49 @@ class GEARSContainer(ContainerPredictor):
                 f"gene-ID space mismatch, not a benign drop. Dropped e.g. {dropped[:10]}")
 
 
-__all__ = ["ContainerPredictor", "GEARSContainer", "COVARIATE_COLUMN"]
+@register
+class PRESAGEContainer(ContainerPredictor):
+    """PRESAGE (Genentech) trained in-container on our leak-safe splits.
+
+    The first genuinely covariate-aware container model: it pseudobulks per
+    ``(cell_type, perturbation)`` and adds a covariate embedding to the
+    perturbation latent, so it can claim the cell-axis regimes GEARS cannot.
+
+    Being *able* to claim them is not evidence it uses them. Before any cell-axis
+    number is reported, the M1.5 gate must pass on replogle22/UnseenBoth: the
+    pair-mode leakage check AND a cell-type-dependent positive control (the same
+    KO under K562 and RPE1 must predict *differently*). If the covariate
+    conditioning is inert they come out identical, and "it ran without leaking"
+    would not have caught it. See docker/presage/TRAINING_VALIDATION.md.
+    """
+
+    name = "PRESAGE-ct"
+    model_dir = "docker/presage"      # holds model.yaml (the run recipe)
+    cell_aware = True                 # conditions on cell_type; gated by M1.5 (above)
+    scenarios = ["UnseenPert", "UnseenCell", "UnseenBoth", "UnseenPair", "UnseenCombo"]
+    has_drop_rule = False             # no prior-knowledge vocabulary drops perturbations
+
+    def _train_report(self, run_dir: Path) -> Optional[Dict]:
+        """Lift the wrapper's training report into ``fingerprint.json``.
+
+        Records which epoch was actually selected and what the run held out —
+        the two things the host-side fingerprint (a hash of the split) cannot
+        show a reader auditing a cell-axis run.
+        """
+        import json
+        path = run_dir / "presage_training_hparams.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text()).get("report")
+        except (OSError, ValueError) as e:
+            log.warning("%s: unreadable %s (%s) — no training report recorded",
+                        self.name, path.name, e)
+            return None
+
+
+__all__ = ["ContainerPredictor", "GEARSContainer", "PRESAGEContainer",
+           "COVARIATE_COLUMN"]
 
 
 # ---------------------------------------------------------------------------
@@ -390,8 +477,11 @@ _REQUIRED_RECIPE_KEYS = frozenset({
     "model_key", "sif_path", "entry", "code_binds", "hyperparameters",
     "expected_artifacts", "train_timeout", "predict_timeout",
 })
-#: Keys it MAY declare.
-_OPTIONAL_RECIPE_KEYS = frozenset({"wandb_project", "gene2go_path"})
+#: Keys it MAY declare. Model-specific container config goes under the single
+#: ``extra_config`` mapping (see ``ContainerPredictor.extra_config``) — never as a
+#: new top-level key, which would make this set a union of every model's private
+#: vocabulary and defeat the unknown-key check below.
+_OPTIONAL_RECIPE_KEYS = frozenset({"wandb_project", "extra_config"})
 
 
 def _validate_recipe(recipe: Dict, where: str) -> None:

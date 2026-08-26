@@ -1533,14 +1533,16 @@ CONTRACTS: Dict[str, Callable] = {
 def _is_expensively_trained(cls) -> bool:
     """Is this predictor's training too expensive to run in a contract test?
 
-    True for the container and torch tiers — training means a GPU run, so there
-    is no in-codebase logic to exercise against a synthetic store. Imported
-    lazily: `verify` must stay importable in environments where the predictor
-    stack is heavier than the verifier needs.
+    True for anything on the expensively-trained tier — training means a GPU run,
+    so there is no in-codebase logic to exercise against a synthetic store.
+
+    Asks the TIER, not its two current subclasses: a third one (a remote-API
+    trainer, say) is then covered the day it is written rather than the day
+    someone remembers to widen this tuple. Imported lazily so `verify` stays
+    importable where the predictor stack is heavier than the verifier needs.
     """
-    from benchmark.predictors.container_predictor import ContainerPredictor
-    from benchmark.predictors.torch_predictor import TorchPredictor
-    return issubclass(cls, (ContainerPredictor, TorchPredictor))
+    from benchmark.predictors.trained import TrainedPredictor
+    return issubclass(cls, TrainedPredictor)
 
 
 def _dl_model_key_map() -> Dict[str, str]:

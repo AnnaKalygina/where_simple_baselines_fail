@@ -153,6 +153,12 @@ def load_and_map(predictions_h5ad, store, scenario: str, fold: int, *,
 
 # ===================================================================
 # Self-test: prove single-cell and pseudobulk row layouts give an IDENTICAL
+# DIAGNOSTIC, not a test suite: this runs against a REAL dataset on disk, which
+# CI does not have. The same properties are covered on a fabricated store in
+# tests/test_container_predictor_e2e.py and run automatically; this exists to
+# check the mapping against real gene names, condition labels and covariates
+# before trusting a scored run. Keep both — they answer different questions.
+#
 # tensor, that the recovered delta matches a fabricated one, and that
 # un-predicted genes stay NaN. Run:
 #   python -m benchmark.predictors._container.tensor_map --selftest \

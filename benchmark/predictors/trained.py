@@ -201,11 +201,6 @@ class TrainedPredictor(Predictor):
     def _seed_for(self, fold: int) -> int:
         return self.seed
 
-    def _wandb_run_name(self, store: DatasetStore, scenario: str,
-                        fold: int) -> str:
-        return (f"{self.name}_{store.dataset}_{scenario}_fold{fold}"
-                f"_seed{self._seed_for(fold)}")
-
     def _check_scenario(self, scenario: str) -> None:
         if scenario not in self.scenarios:
             raise ValueError(
@@ -346,8 +341,11 @@ class TrainedPredictor(Predictor):
                 f"the prediction axes do not match the fold's test set.")
         if not np.isfinite(deltas).any():
             raise RuntimeError(
-                f"{self.name}: all-NaN delta tensor for {store.dataset}/{scenario}/"
-                f"fold{fold} — condition/covariate mapping mismatch?")
+                f"{self.name}: no finite prediction anywhere in "
+                f"{store.dataset}/{scenario}/fold{fold}. Either the model declined "
+                f"every test cell (a drop rule covering the whole fold — check "
+                f"perturbation coverage), or the condition/covariate mapping "
+                f"failed and nothing matched. Both are worth stopping for.")
         return deltas
 
 
