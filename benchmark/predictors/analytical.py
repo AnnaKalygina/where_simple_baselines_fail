@@ -51,7 +51,6 @@ log = logging.getLogger(__name__)
 @register
 class Zero(Predictor):
     name = "Zero"
-    needs_training = False
     scenarios = [
         "UnseenPert", "UnseenCell", "UnseenBoth", "UnseenPair",
         "UnseenDose", "UnseenCombo",
@@ -81,7 +80,6 @@ class MeanOverPerturbations(Predictor):
     (cell, pert) pairs are held out, every bin is still in training).
     """
     name = "Mean-over-perturbations"
-    needs_training = False
     scenarios = ["UnseenPert", "UnseenPair"]
 
     def fit(self, store, scenario, fold):
@@ -129,7 +127,6 @@ class MeanOverCellTypes(Predictor):
     """For each test pert (seen during training), predict its mean delta across training bins."""
 
     name = "Mean-over-cell-types"
-    needs_training = False
     scenarios = ["UnseenCell", "UnseenPair"]
 
     def fit(self, store, scenario, fold):
@@ -168,7 +165,6 @@ class MeanOverPerturbationsAndCellTypes(Predictor):
     for every (bin, ko) in the test set."""
 
     name = "Mean-over-perturbations-and-cell-types"
-    needs_training = False
     scenarios = ["UnseenPert", "UnseenCell", "UnseenBoth", "UnseenPair"]
 
     def fit(self, store, scenario, fold):
@@ -212,7 +208,6 @@ class TwoWayMean(Predictor):
     in training, only specific pairs are held out).
     """
     name = "Two-way-mean"
-    needs_training = False
     scenarios = ["UnseenPair"]
 
     def fit(self, store, scenario, fold):
@@ -305,7 +300,6 @@ class Additive(Predictor):
     """Δ_AB = Δ_A + Δ_B for 2-way combo perturbations."""
     name = "Additive"
     has_drop_rule = True
-    needs_training = False
     scenarios = ["UnseenCombo"]
 
     def fit(self, store, scenario, fold):
@@ -331,7 +325,6 @@ class MatchingMean(Predictor):
     """Δ̂_AB = (Δ_A + Δ_B) / 2 — averaging variant of Additive (2-way combos)."""
     name = "Matching-mean"
     has_drop_rule = True
-    needs_training = False
     scenarios = ["UnseenCombo"]
 
     def fit(self, store, scenario, fold):
@@ -380,7 +373,6 @@ class ScaledDelta(Predictor):
     """
     name = "Scaled-delta"
     has_drop_rule = True
-    needs_training = False
     scenarios = ["UnseenDose"]
 
     def fit(self, store, scenario, fold):
@@ -448,7 +440,6 @@ class TargetZero(Predictor):
     """
     name = "TargetZero"
     has_drop_rule = True
-    needs_training = False
     scenarios = [
         "UnseenPert", "UnseenCell", "UnseenBoth", "UnseenPair",
         "UnseenDose", "UnseenCombo",

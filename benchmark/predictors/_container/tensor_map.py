@@ -15,10 +15,10 @@ pseudobulk of those cells. Either way the benchmark sees the same thing — the
 mean absolute profile per cell, minus control. The container's prediction
 *space* only changes how many rows arrive; the reduction is identical.
 
-The three mapping primitives are **preserved verbatim** from the (to-be-removed)
-``benchmark.predictors.dl_adapter``/``_fold_align`` path so this keeps working
-after that machinery is deleted (see ``TRAINING_INFRA_PLAN.md`` §Decommissioning
-& §Engineering-quality commitments #1):
+The three mapping primitives were **preserved verbatim** from the adopted-DL
+path (``dl_adapter.py`` / ``_fold_align.py``) so this kept working after that
+machinery was deleted. It now is: those modules are gone, and the copies below
+are the only remaining implementations.
   * ``normalize_combo_label`` — collapses the DL '+N'/'_N' guide encoding so a
     model's ``FDPS+HUS1+2`` matches our ``FDPS+HUS1_2`` (no-op for single genes).
   * gene-set **intersection** by symbol — genes the model doesn't predict stay
@@ -39,8 +39,8 @@ _DEGENERATE_COV = {"", "none", "None", "nan", "NaN", "NOTHING", "nothing"}
 
 
 def normalize_combo_label(c: str) -> str:
-    """Guide-resolved canonical key for a (combo) condition — PRESERVED verbatim
-    from ``benchmark._fold_align.normalize_combo_label``.
+    """Guide-resolved canonical key for a (combo) condition — preserved verbatim
+    from the deleted ``benchmark._fold_align.normalize_combo_label``.
 
     The DL prediction h5ads write per-guide suffixes with '+' (the same char as
     the combo separator): our 'FDPS+HUS1_2' / 'FDPS_2+HUS1_2' appear as
@@ -60,12 +60,26 @@ def normalize_combo_label(c: str) -> str:
     return "+".join(sorted(genes))
 
 
+def _assert_unique(names, what: str) -> None:
+    """Gene axes are used as dict keys; duplicates must not pass silently."""
+    seen, dupes = set(), []
+    for n in names:
+        if n in seen and len(dupes) < 5:
+            dupes.append(str(n))
+        seen.add(n)
+    if dupes:
+        raise ValueError(
+            f"{what}: duplicate gene name(s) {dupes} — a name-keyed axis cannot "
+            f"be built from a non-unique index without silently losing genes")
+
+
 def map_predictions_to_delta_tensor(adata, store, scenario: str, fold: int, *,
                                     model_name: str = "container") -> np.ndarray:
     """Reduce a container's ``predictions.h5ad`` (``adata``) to the benchmark's
     ``(n_test_bins, n_test_kos, n_genes)`` delta tensor for ``(scenario, fold)``.
 
-    Faithful port of the proven ``DLAdapter.predict`` mapping. Unmatched
+    Faithful port of the ``DLAdapter.predict`` mapping, validated against it
+    while that tier existed; the original has since been deleted. Unmatched
     ``(bin, ko)`` cells and un-predicted genes are left NaN (skipped by metrics).
     """
     split = store.split(scenario, fold)
@@ -75,6 +89,11 @@ def map_predictions_to_delta_tensor(adata, store, scenario: str, fold: int, *,
 
     # --- gene intersection (by symbol); model genes not in the store are dropped,
     #     store genes the model doesn't predict stay NaN. ---
+    # Duplicate names would collapse to the LAST index here, silently dropping a
+    # gene from the mapping and mis-attributing its prediction. Cheap to assert,
+    # impossible to notice downstream.
+    _assert_unique(adata.var_names, f"{model_name} predictions.h5ad var_names")
+    _assert_unique(store.gene_names, f"{store.dataset} store.gene_names")
     model_to_idx = {g: i for i, g in enumerate(adata.var_names)}
     store_gene_to_idx = {g: i for i, g in enumerate(store.gene_names)}
     common = [(m, store_gene_to_idx[g]) for g, m in model_to_idx.items()
@@ -135,6 +154,12 @@ def load_and_map(predictions_h5ad, store, scenario: str, fold: int, *,
 
 # ===================================================================
 # Self-test: prove single-cell and pseudobulk row layouts give an IDENTICAL
+# DIAGNOSTIC, not a test suite: this runs against a REAL dataset on disk, which
+# CI does not have. The same properties are covered on a fabricated store in
+# tests/test_container_predictor_e2e.py and run automatically; this exists to
+# check the mapping against real gene names, condition labels and covariates
+# before trusting a scored run. Keep both — they answer different questions.
+#
 # tensor, that the recovered delta matches a fabricated one, and that
 # un-predicted genes stay NaN. Run:
 #   python -m benchmark.predictors._container.tensor_map --selftest \

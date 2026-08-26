@@ -864,10 +864,13 @@ class GEARSWrapper:
         checkpoint_dir = Path(self.config['checkpoint_dir'])
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
-        if self._has_checkpoint(checkpoint_dir):
-            log.info("Found existing checkpoint, resuming training...")
-            self.model.load_pretrained(str(checkpoint_dir))
-        
+        # NOTE: no resume branch. The host wipes the run dir before every train
+        # (TrainedPredictor._prepare_run_dir), so a resume path here was dead code
+        # that would silently reactivate — training N more epochs on top of
+        # existing weights while the metadata claimed a fresh run — if that wipe
+        # were ever relaxed. Resumption, if wanted, must be an explicit mode in
+        # the contract, not an implicit consequence of a leftover directory.
+
         # 7. Train with GEARS' own checkpointing
         log.info("Starting model training...")
         epochs = self.config['hyperparameters']['epochs']
@@ -1188,10 +1191,6 @@ class GEARSWrapper:
         }
         
         return params
-        
-    def _has_checkpoint(self, checkpoint_dir: Path) -> bool:
-        """Check if GEARS checkpoint exists."""
-        return (checkpoint_dir / 'model.pt').exists() and (checkpoint_dir / 'config.pkl').exists()
         
     def _generate_predictions(self, test_conditions: List[str]) -> Dict:
         """Generate GEARS predictions for test conditions."""

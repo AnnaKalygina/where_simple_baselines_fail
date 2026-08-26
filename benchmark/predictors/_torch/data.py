@@ -145,6 +145,18 @@ def compute_norm_stats(store: DatasetStore, split: SplitInfo) -> NormStats:
 # Perturbation encoding
 # ---------------------------------------------------------------------------
 
+def unrepresentable_kos(store: DatasetStore) -> np.ndarray:
+    """Indices of perturbations whose target genes are all absent from the panel.
+
+    Their marker vector is all-zero, so the model literally cannot tell them from
+    an unperturbed control. Emitting a confident prediction there would be scored
+    as if it meant something; the benchmark's convention for "cannot represent
+    this KO" is NaN plus `has_drop_rule`.
+    """
+    pert, _ = build_perturbation_matrix(store)
+    return np.where(~pert.any(axis=1))[0]
+
+
 def build_perturbation_matrix(store: DatasetStore) -> Tuple[np.ndarray, int]:
     """(n_kos, n_genes) float32: dose at each ko's target gene(s), else 0.
 
@@ -155,6 +167,11 @@ def build_perturbation_matrix(store: DatasetStore) -> Tuple[np.ndarray, int]:
     rather than passed over silently.
     """
     gene_to_idx = store.gene_to_index
+    if len(gene_to_idx) != store.n_genes:
+        raise ValueError(
+            f"{store.dataset}: gene_names has duplicates "
+            f"({store.n_genes} names, {len(gene_to_idx)} unique) — a name-keyed "
+            f"index cannot be built without silently losing genes")
     p = np.zeros((store.n_kos, store.n_genes), dtype=np.float32)
     unrepresentable = 0
     for k, ko_name in enumerate(store.ko_names):
@@ -185,18 +202,24 @@ class PerturbationPairs(Dataset):
     def __init__(
         self,
         pairs: np.ndarray,            # (M, 2) int64: (bin_idx, ko_idx)
-        deltas: np.ndarray,           # (n_bins, n_kos, n_genes)
         ctrl_bulk: np.ndarray,        # (n_bins, n_genes)
         pert_matrix: np.ndarray,      # (n_kos, n_genes)
         stats: NormStats,
+        deltas: Optional[np.ndarray] = None,   # (n_bins, n_kos, n_genes); TRAINING only
     ) -> None:
+        """`deltas` is the training target and is optional on purpose.
+
+        Inference reads only `x_wt`/`p`/`gene_idx`, so requiring the target would
+        force `store.all_deltas` — a COMPUTED property that materialises
+        (n_bins, n_kos, n_genes); ~1 GB on ecoli — to be built for nothing.
+        """
         self.pairs = np.asarray(pairs, dtype=np.int64)
         self._deltas = deltas
         self._ctrl = ctrl_bulk
         self._pert = pert_matrix
         self._stats = stats
         self._x_wt = ((ctrl_bulk - stats.mu) / stats.sigma).astype(np.float32)
-        self._gene_idx = np.arange(deltas.shape[-1], dtype=np.int64)
+        self._gene_idx = np.arange(ctrl_bulk.shape[-1], dtype=np.int64)
 
     def __len__(self) -> int:
         return int(self.pairs.shape[0])
@@ -220,6 +243,10 @@ class PerturbationPairs(Dataset):
         return np.broadcast_to(self._gene_idx, (n_rows, self.n_genes)).copy()
 
     def __getitem__(self, i: int) -> Dict[str, torch.Tensor]:
+        if self._deltas is None:
+            raise RuntimeError(
+                "this dataset was built for inference (no targets) — it cannot "
+                "yield training samples")
         b, k = self.pairs[i]
         delta = (self._deltas[b, k] / self._stats.sigma).astype(np.float32)
         return {
@@ -318,8 +345,8 @@ def build_fold_data(
     train_pairs = pairs_from_mask(split.train_mask_2d(n_bins, n_kos))
     v_pairs = pairs_from_mask(val_mask(store, split))
 
-    train_ds = PerturbationPairs(train_pairs, deltas, ctrl, pert, stats)
-    val_ds = (PerturbationPairs(v_pairs, deltas, ctrl, pert, stats)
+    train_ds = PerturbationPairs(train_pairs, ctrl, pert, stats, deltas=deltas)
+    val_ds = (PerturbationPairs(v_pairs, ctrl, pert, stats, deltas=deltas)
               if v_pairs.shape[0] else None)
     weights = ko_sampling_weights(deltas, train_pairs, stats.sigma, alpha=alpha)
 

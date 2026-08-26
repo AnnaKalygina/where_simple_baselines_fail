@@ -18,40 +18,46 @@ import would drop every transformer from the registry (or crash the CLI).
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
 
-from benchmark.config import checkpoint_dir
 from benchmark.data_loader import DatasetStore
-from benchmark.predictors._shared import _expected_output_shape
 from benchmark.predictors._torch import recipe
-from benchmark.predictors.base import Predictor
+from benchmark.predictors.trained import TrainedPredictor
 
 log = logging.getLogger(__name__)
 
 CHECKPOINT_FILE = "checkpoint_best.pt"
-FINGERPRINT_FILE = "fingerprint.json"
+NORM_STATS_FILE = "norm_stats.npz"
 
 
-class TorchPredictor(Predictor):
+class TorchPredictor(TrainedPredictor):
     """Base for in-process torch-trained predictors.
 
     Subclasses supply `name`, `scenarios`, and `architecture()`.
     """
 
-    needs_training = True
-    # Every test (bin, ko) gets a prediction — the model is defined for any
-    # perturbation marker, including the all-zero one. No drop rule.
-    has_drop_rule = False
-
-    #: overridden per fold via `recipe.seed_for_fold`; kept as an attribute so a
-    #: subclass or a test can pin it.
+    # A perturbation whose targets are absent from the panel gets an all-zero
+    # marker, i.e. it is indistinguishable from control. Those are emitted as NaN
+    # rather than guessed, which is a drop rule.
+    has_drop_rule = True
+    #: None => fold-derived seed (see `_seed_for`); set to pin one.
     seed: Optional[int] = None
-    wandb_project: Optional[str] = None
+
+    #: How long before a `RUNNING.json` from this tier is presumed abandoned.
+    #: The container tier reuses its `train_timeout` for this, because there the
+    #: timeout really does kill the run. Nothing kills an in-process torch run,
+    #: so there is no timeout to borrow — inheriting the base class's 24 h would
+    #: be a number nobody chose. 12 h is above the longest observed fold
+    #: (~3 h for 12x1 on one GPU) with room for a slower card or a busy node.
+    claim_ttl_seconds: float = 12 * 3600
+
+    def _claim_ttl(self) -> float:
+        return float(self.claim_ttl_seconds)
+
 
     # ------------------------------------------------------------------
     # Subclass hook
@@ -65,74 +71,35 @@ class TorchPredictor(Predictor):
     # Paths / identity
     # ------------------------------------------------------------------
 
-    def _run_dir(self, store: DatasetStore, scenario: str, fold: int) -> Path:
-        return checkpoint_dir(store.dataset, self.name, scenario, fold)
-
     def _seed_for(self, fold: int) -> int:
+        """Fold-derived unless pinned, so a fold means the same thing everywhere."""
         return self.seed if self.seed is not None else recipe.seed_for_fold(fold)
 
-    def _fingerprint(self, store: DatasetStore, scenario: str, fold: int) -> Dict:
-        """What the checkpoint must agree with to be reusable.
-
-        Gene axis included by identity, not just by count: a dataset rebuild that
-        changes the panel silently invalidates every earlier checkpoint, and the
-        failure would otherwise surface as a shape error deep inside the model.
-        """
-        return {
-            "predictor": self.name,
-            "dataset": store.dataset,
-            "scenario": scenario,
-            "fold": int(fold),
-            "seed": int(self._seed_for(fold)),
-            "n_genes": int(store.n_genes),
-            "gene_axis_sha": _sha_of_sequence(store.gene_names),
-            "architecture": {k: v for k, v in
-                             self.architecture(store.n_genes).items()},
-        }
+    def _recipe_fingerprint(self) -> Dict:
+        """What changes what training produces: the shared schedule plus this
+        variant's architecture."""
+        return {"training": dict(recipe.TRAINING),
+                "sample_weight": dict(recipe.SAMPLE_WEIGHT),
+                "architecture": self.architecture(0)}
 
     # ------------------------------------------------------------------
     # Predictor interface
     # ------------------------------------------------------------------
 
-    def unusable_reason(
-        self, store: DatasetStore, scenario: str, fold: int,
-    ) -> Optional[str]:
-        """Why this checkpoint cannot be used, or None if it can."""
-        run_dir = self._run_dir(store, scenario, fold)
-        for rel in (CHECKPOINT_FILE, FINGERPRINT_FILE):
-            if not (run_dir / rel).exists():
-                return f"missing {rel}"
-        try:
-            stored = json.loads((run_dir / FINGERPRINT_FILE).read_text())
-        except (OSError, ValueError) as e:
-            return f"unreadable {FINGERPRINT_FILE} ({e})"
+    def _expected_artifacts(self) -> List[str]:
+        return [CHECKPOINT_FILE, NORM_STATS_FILE]
 
-        current = self._fingerprint(store, scenario, fold)
-        for key in ("n_genes", "gene_axis_sha", "seed", "architecture"):
-            if stored.get(key) != current[key]:
-                return (f"checkpoint was trained with a different {key} "
-                        f"({stored.get(key)!r} != {current[key]!r}); retrain "
-                        f"with --force")
-        return None
-
-    def is_trained(self, store: DatasetStore, scenario: str, fold: int) -> bool:
-        return self.unusable_reason(store, scenario, fold) is None
-
-    def fit(self, store: DatasetStore, scenario: str, fold: int) -> None:
+    def _train(self, store: DatasetStore, scenario: str, fold: int,
+               run_dir: Path) -> Dict:
         import torch
         from benchmark.predictors._torch import data as td
         from benchmark.predictors._torch.model import GeneTransformer
         from benchmark.predictors._torch import trainer as tr
 
-        self._check_scenario(scenario)
         seed = self._seed_for(fold)
-        run_dir = self._run_dir(store, scenario, fold)
-        run_dir.mkdir(parents=True, exist_ok=True)
-
         tr.set_seed(seed)
         fold_data = td.build_fold_data(
             store, scenario, fold, alpha=float(recipe.SAMPLE_WEIGHT["alpha"]))
-        self._assert_leak_safe(store, scenario, fold, fold_data)
 
         train_loader, val_loader = td.make_loaders(
             fold_data,
@@ -160,32 +127,17 @@ class TorchPredictor(Predictor):
 
         # Normalisation constants are part of the trained state: predict must
         # rescale with the SAME sigma the targets were divided by.
-        np.savez(str(run_dir / "norm_stats.npz"), **fold_data.stats.to_dict())
-        fp = self._fingerprint(store, scenario, fold)
-        fp["report"] = report.to_dict()
-        (run_dir / FINGERPRINT_FILE).write_text(json.dumps(fp, indent=2))
+        np.savez(str(run_dir / NORM_STATS_FILE), **fold_data.stats.to_dict())
+        return report.to_dict()
 
-        missing = self.unusable_reason(store, scenario, fold)
-        if missing:
-            raise RuntimeError(
-                f"{self.name}: training finished but left an unusable run dir at "
-                f"{run_dir} — {missing}. Failing here rather than at predict.")
-
-    def predict(self, store: DatasetStore, scenario: str, fold: int) -> np.ndarray:
+    def _infer(self, store: DatasetStore, scenario: str, fold: int,
+               run_dir: Path) -> np.ndarray:
         import torch
         from benchmark.predictors._torch import data as td
         from benchmark.predictors._torch.model import GeneTransformer
         from benchmark.predictors._torch import trainer as tr
 
-        self._check_scenario(scenario)
-        run_dir = self._run_dir(store, scenario, fold)
-        reason = self.unusable_reason(store, scenario, fold)
-        if reason:
-            raise RuntimeError(
-                f"{self.name}: no usable trained model at {run_dir} — {reason}. "
-                f"Run `fit` (or `all`) first; predict never trains.")
-
-        stats = td.NormStats.from_dict(np.load(str(run_dir / "norm_stats.npz")))
+        stats = td.NormStats.from_dict(np.load(str(run_dir / NORM_STATS_FILE)))
         pert, _ = td.build_perturbation_matrix(store)
         split = store.split(scenario, fold)
         tbi = split.test_bin_indices_or_all(store.n_bins)
@@ -195,8 +147,10 @@ class TorchPredictor(Predictor):
         # predictor: the metric layer selects what it scores.
         pairs = np.array([(b, k) for b in tbi for k in tki], dtype=np.int64)
 
-        view = td.PerturbationPairs(pairs, store.all_deltas, store.ctrl_bulk,
-                                    pert, stats)
+        # No targets passed: inference reads only x_wt/p/gene_idx, and
+        # `store.all_deltas` is a computed property that would materialise a
+        # ~1 GB cube for nothing.
+        view = td.PerturbationPairs(pairs, store.ctrl_bulk, pert, stats)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = GeneTransformer(num_genes=store.n_genes,
                                 **self.architecture(store.n_genes))
@@ -208,39 +162,46 @@ class TorchPredictor(Predictor):
         # Back to the benchmark's units: targets were divided by sigma.
         preds = scaled * stats.sigma[None, :]
 
-        out = np.full(_expected_output_shape(store, tbi, tki), np.nan,
-                      dtype=np.float32)
-        out.reshape(-1, store.n_genes)[:] = preds
+        # `pairs` was built as [(b, k) for b in tbi for k in tki], which is
+        # exactly C order over (bin, ko) — reshape rather than index, and let the
+        # shape check in the template catch any future reordering.
+        out = preds.reshape(len(tbi), len(tki), store.n_genes).astype(np.float32)
+
+        # Decline the perturbations the model cannot represent: an all-zero
+        # marker makes them identical to control, so a number here would be
+        # scored as if it meant something.
+        blind = set(td.unrepresentable_kos(store).tolist())
+        if blind:
+            cols = [j for j, k in enumerate(tki) if int(k) in blind]
+            if cols:
+                out[:, cols, :] = np.nan
+                log.warning("%s: %d test perturbation(s) have no target gene in "
+                            "the panel — emitting NaN rather than a guess",
+                            self.name, len(cols))
         return out
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _check_scenario(self, scenario: str) -> None:
-        if scenario not in self.scenarios:
-            raise ValueError(
-                f"{self.name} does not declare scenario {scenario!r} "
-                f"(declares {self.scenarios})")
+    def _leakage_gate(self, store: DatasetStore, scenario: str, fold: int) -> None:
+        """Prove no held-out (bin, ko) cell can reach training.
 
-    def _assert_leak_safe(self, store, scenario, fold, fold_data) -> None:
-        """Host-side gate: nothing held out may reach training.
-
-        `_torch.data` already builds the pair index from the train mask; this
-        re-checks the result, because a leak that reaches training is invisible
-        in every downstream metric — it just makes the model look good.
+        Answered from the split masks alone, so it runs BEFORE any data is built
+        or a GPU is touched. A leak that reaches training is invisible
+        downstream — every metric simply looks better — so this fails loudly.
         """
         split = store.split(scenario, fold)
+        train = np.argwhere(split.train_mask_2d(store.n_bins, store.n_kos))
         test = split.test_mask_2d(store.n_bins, store.n_kos)
-        pairs = fold_data.train.pairs
-        leaked = int(test[pairs[:, 0], pairs[:, 1]].sum())
+        leaked = int(test[train[:, 0], train[:, 1]].sum()) if len(train) else 0
         if leaked:
             raise RuntimeError(
-                f"{self.name}: leakage gate FAILED — {leaked} of {len(pairs)} "
+                f"{self.name}: LEAKAGE GATE FAILED — {leaked} of {len(train)} "
                 f"training pairs are held-out cells in "
                 f"{store.dataset}/{scenario}/fold{fold}")
         log.info("%s leakage gate OK (%d train pairs, 0 leaked) — %s/%s/fold%d",
-                 self.name, len(pairs), store.dataset, scenario, fold)
+                 self.name, len(train), store.dataset, scenario, fold)
 
     def _start_wandb(self, store, scenario, fold, seed):
         if not self.wandb_project:
@@ -265,12 +226,3 @@ class TorchPredictor(Predictor):
             log.warning("%s: wandb init failed (%s) — training unlogged",
                         self.name, e)
             return None
-
-
-def _sha_of_sequence(items: List[str]) -> str:
-    import hashlib
-    h = hashlib.sha256()
-    for s in items:
-        h.update(str(s).encode())
-        h.update(b"\0")
-    return h.hexdigest()[:16]

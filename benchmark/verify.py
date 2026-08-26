@@ -6,12 +6,12 @@ run inside `DatasetStore.__init__`) and the old `verify` harness, and adds the
 checks that actually catch silent breakage.
 
 Self-containment rule: this module imports ONLY core benchmark modules (config,
-data_loader, predictors.*, meta_metrics, dl_adapter). It NEVER imports from
+data_loader, predictors.*, meta_metrics). It NEVER imports from
 `benchmark/scripts/`. Ad-hoc scripts may import from here, not the other way
 round. Module-level imports are kept minimal (numpy + config) so
 `DatasetStore.__init__` (which imports `validate_dataset` from here) stays light
 and there is no import cycle — every heavy import (DatasetStore, predictors,
-anndata, meta_metrics, dl_adapter) is done lazily inside the function that needs it.
+anndata, meta_metrics) is done lazily inside the function that needs it.
 
 Layers (mapped to the failure modes they guard)
 ------------------------------------------------
@@ -30,11 +30,11 @@ Layers (mapped to the failure modes they guard)
                        fallback (e.g. TargetScaling really scales).    [FM no-fallback/correctness]
   L5 COVERAGE          per dataset: perturbed genes + (bin,ko) perts, which each
                        predictor can resolve, and the cross-predictor overlap. [targets diagnostic]
-  L6 FOLD-ALIGNMENT    DL fold test-sets == our h5ad fold test-sets (exact);
-                       saved predictions' fold/scenario metadata match the split. [FM fold alignment]
+  L6 PRED-ALIGNMENT    saved predictions' fold/scenario/dataset metadata match the
+                       split, and their test KOs are a subset of it. [FM fold alignment]
 
 Levels: `--fast` (L1,L2,L4,L5 + L0 via store open; numpy-only, runs in `preprocess`)
-        `--full` (adds L3,L6; needs saved predictions + the DL manifest; `vcell`).
+        `--full` (adds L3,L6; needs saved predictions; `vcell`).
 
 Run:
   conda run -n preprocess python -m benchmark.verify --fast
@@ -75,17 +75,11 @@ _SKIP_SENTINEL = "n_cells_first"  # pseudobulk key present only on all-cell-awar
 # rectangle, no mask needed.)
 _NON_RECTANGULAR_SCENARIOS = ("UnseenBoth", "UnseenPair")
 
-# Guide-suffix / junk handling for matching OUR (guide-free) ko_names against the
-# DL prediction labels, which encode per-guide variants (e.g. 'FDPS_2'). Our own
-# ko_names carry no guide suffixes (stripped in get_data), so all guide-awareness
-# lives at the DL↔ours matching layer, never in the canonical parse_target_genes.
-# Canonical pert-key matching + the DL declared-test-set reader live in the shared
-# leaf benchmark._fold_align (single source of truth; keeps the gate and the verifier
-# in lock-step and avoids a verify↔dl_adapter import cycle).
-from benchmark._fold_align import (  # noqa: E402
-    match_key as _match_key, canon_set as _canon_set,
-    dl_declared_test_set as _dl_declared_test_set,
-)
+# Guide-suffix matching and the DL declared-test-set reader used to be imported
+# here from a shared leaf module: they reconciled OUR guide-free ko_names with
+# externally-computed DL prediction labels ('FDPS_2'). Both are gone with the
+# adapter tier — every predictor now trains in this repo against our own splits,
+# so there is no second naming convention left to reconcile.
 
 
 # ===================================================================
@@ -1507,8 +1501,8 @@ def _c_missing_genes(r):
             _row(drop, 1) is None)
 
 
-# name -> contract fn. DL adapters have no synthetic contract (they read external
-# manifest h5ads) — they are covered by L6 fold-alignment instead.
+# name -> contract fn. Everything that can be exercised on a synthetic store has
+# one; the expensively-trained tier is exempt (see the meta-check below).
 CONTRACTS: Dict[str, Callable] = {
     "Zero": _c_zero,
     "TargetZero": _c_targetzero,
@@ -1533,24 +1527,16 @@ CONTRACTS: Dict[str, Callable] = {
 def _is_expensively_trained(cls) -> bool:
     """Is this predictor's training too expensive to run in a contract test?
 
-    True for the container and torch tiers — training means a GPU run, so there
-    is no in-codebase logic to exercise against a synthetic store. Imported
-    lazily: `verify` must stay importable in environments where the predictor
-    stack is heavier than the verifier needs.
+    True for anything on the expensively-trained tier — training means a GPU run,
+    so there is no in-codebase logic to exercise against a synthetic store.
+
+    Asks the TIER, not its two current subclasses: a third one (a remote-API
+    trainer, say) is then covered the day it is written rather than the day
+    someone remembers to widen this tuple. Imported lazily so `verify` stays
+    importable where the predictor stack is heavier than the verifier needs.
     """
-    from benchmark.predictors.container_predictor import ContainerPredictor
-    from benchmark.predictors.torch_predictor import TorchPredictor
-    return issubclass(cls, (ContainerPredictor, TorchPredictor))
-
-
-def _dl_model_key_map() -> Dict[str, str]:
-    """{display_name: MANIFEST.json model_key} for the DL adapters, read straight
-    from the predictor registry (DLAdapter subclasses already set ``model_key``).
-    Single source — no separate hardcoded DL list to drift."""
-    from benchmark.predictors.base import PREDICTOR_REGISTRY, get_predictor
-    get_predictor("Zero")  # force-populate the registry
-    return {n: c.model_key for n, c in PREDICTOR_REGISTRY.items()
-            if getattr(c, "model_key", "")}
+    from benchmark.predictors.trained import TrainedPredictor
+    return issubclass(cls, TrainedPredictor)
 
 
 def _drop_rule_predictors() -> Set[str]:
@@ -1580,16 +1566,14 @@ def verify_predictor_contracts(r: Results) -> None:
     _c_target_errors(r)
     _c_missing_genes(r)
     # Meta-check: every registered predictor whose logic IS in-codebase must have
-    # a contract. Exempt are the ones whose logic cannot be exercised on a
-    # synthetic store: DL adapters (predictions computed elsewhere) and the
-    # expensively-trained tiers, whose "logic" is GPU-hours of training —
-    # container predictors run it inside a .sif, torch predictors in-process.
-    # Derived from the class, not declared, so a new predictor cannot arrive with
-    # a stale flag and quietly skip the check.
+    # a contract. The only exemption left is the expensively-trained tier, whose
+    # "logic" is GPU-hours of training — container predictors run it inside a
+    # .sif, torch predictors in-process; neither is exercisable on a synthetic
+    # store. Derived from the class, not declared, so a new predictor cannot
+    # arrive with a stale flag and quietly skip the check.
     missing = [n for n, c in PREDICTOR_REGISTRY.items()
-               if n not in CONTRACTS and n not in _dl_model_key_map()
-               and not _is_expensively_trained(c)]
-    r.check("contract suite covers every non-DL predictor", not missing,
+               if n not in CONTRACTS and not _is_expensively_trained(c)]
+    r.check("contract suite covers every cheaply-runnable predictor", not missing,
             f"uncontracted: {missing}" if missing else "")
 
 
@@ -1601,50 +1585,12 @@ def verify_predictor_contracts(r: Results) -> None:
 # `overlapping_perturbations.explain()`; it lives HERE (core), so the script can
 # import it (script -> core), not the other way round.
 
-# The DL model-key map and the drop-rule predictor set are derived from the
-# predictor registry (`model_key` / `has_drop_rule` class attributes) via
-# `_dl_model_key_map()` / `_drop_rule_predictors()` above — no hardcoded list here.
+# The drop-rule predictor set is derived from the predictor registry
+# (`has_drop_rule` class attribute) via `_drop_rule_predictors()` above — no
+# hardcoded list here.
 
 
-# _match_key / _canon_set / _dl_declared_test_set are imported from
-# benchmark._fold_align at the top of this module.
-
-
-def _dl_model_info(dataset: str, scenario: str) -> Dict[str, Dict[str, Set[str]]]:
-    """{model_lower: {genes: modeled-gene-set, preds: predicted conditions}} from
-    the DL prediction h5ads (panel-independent). Empty if no manifest."""
-    import anndata as ad
-    from benchmark._fold_align import load_manifest, get_model_folds
-    out: Dict[str, Dict[str, Set[str]]] = {}
-    try:
-        fbm = get_model_folds(load_manifest(), dataset, scenario)
-    except Exception as e:
-        log.warning("coverage: manifest lookup failed for %s/%s: %s", dataset, scenario, e)
-        return out
-    for model, folds in fbm.items():
-        genes: Set[str] = set()
-        preds: Set[str] = set()
-        for f in folds:
-            try:
-                h = ad.read_h5ad(str(f["predictions_path"]), backed="r")
-                try:
-                    genes |= {str(g) for g in h.var_names}
-                    col = "condition" if "condition" in h.obs.columns else h.obs.columns[0]
-                    preds |= {_match_key(c) for c in h.obs[col].astype(str).unique()
-                              if not _is_control(c)}
-                finally:
-                    try:
-                        h.file.close()
-                    except Exception:
-                        pass
-            except Exception as e:
-                log.warning("coverage: read %s %s/%s: %s", model, dataset, scenario, e)
-        out[model] = {"genes": genes, "preds": preds}
-    return out
-
-
-def handles(predictor: str, ko: str, store, scenario: str,
-            dl_info: Optional[dict] = None) -> Tuple[bool, Optional[str]]:
+def handles(predictor: str, ko: str, store, scenario: str) -> Tuple[bool, Optional[str]]:
     """Can `predictor` produce a valid prediction for perturbation `ko`?
 
     Returns (True, None) if handled, else (False, reason_code). Rule-based — the
@@ -1658,17 +1604,6 @@ def handles(predictor: str, ko: str, store, scenario: str,
     # dominant cost on high-pert datasets (e.g. xatlas: ~18k kos x ~15 predictors).
     gene_set = store.gene_name_set
     ko_set = store.ko_name_set
-
-    dl_keys = _dl_model_key_map()
-    if predictor in dl_keys:
-        info = (dl_info or {}).get(dl_keys[predictor], {})
-        genes, preds = info.get("genes", set()), info.get("preds", set())
-        if _match_key(ko) in preds:
-            return True, None
-        missing = [t for t in tokens if t not in genes]
-        if genes and missing:
-            return False, "gene_not_modeled"
-        return False, "pert_not_supported"
 
     if predictor == "BilinearRidge":
         if len(tokens) > 1:
@@ -1711,15 +1646,13 @@ def verify_coverage(store, r: Results, scenario: Optional[str] = None,
           f"{len(non_ctrl)} perturbations, {len(gene_universe)} perturbed genes")
     for sc in scenarios:
         applicable = [n for n, cls in PREDICTOR_REGISTRY.items() if sc in cls.scenarios]
-        dl_keys = _dl_model_key_map()
         drop_rule = _drop_rule_predictors()
-        dl_info = _dl_model_info(ds, sc) if any(p in dl_keys for p in applicable) else {}
         ko_cov: Dict[str, Set[str]] = {}
         gene_cov: Dict[str, Set[str]] = {}
         for p in applicable:
             handled_kos = set()
             for k in non_ctrl:
-                ok, _ = handles(p, k, store, sc, dl_info)
+                ok, _ = handles(p, k, store, sc)
                 if ok:
                     handled_kos.add(k)
             ko_cov[p] = handled_kos
@@ -1755,8 +1688,7 @@ def verify_coverage(store, r: Results, scenario: Optional[str] = None,
                    + ", ".join(f"{p}({len(ko_cov[p])})" for p in worst))
         # The one HARD invariant: predictors with no drop rule must cover every pert.
         leaky = [p for p in applicable
-                 if p not in drop_rule and p not in dl_keys
-                 and len(ko_cov[p]) != len(non_ctrl)]
+                 if p not in drop_rule and len(ko_cov[p]) != len(non_ctrl)]
         r.check(f"coverage {ds}/{sc}: no-drop-rule predictors cover all perts",
                 not leaky,
                 f"unexpected shortfall: {[(p, len(ko_cov[p])) for p in leaky]}" if leaky else "")
@@ -1771,75 +1703,13 @@ def verify_coverage(store, r: Results, scenario: Optional[str] = None,
 
 
 # ===================================================================
-# L6 — fold alignment (DL vs our h5ad) + saved-prediction alignment
+# L6 — saved-prediction alignment
 # ===================================================================
-
-# _canon_set / _dl_declared_test_set now live in benchmark._fold_align (imported above).
-
-
-def verify_fold_alignment(store, r: Results) -> None:
-    """L6: for every DL model in the manifest for this dataset, require each DL
-    fold's TEST perturbation set to EXACTLY equal one of our h5ad fold test sets
-    (Jaccard==1, a bijection). UnseenCell is pert-degenerate and reported, not
-    failed."""
-    from benchmark._fold_align import load_manifest, get_model_folds
-    ds = store.dataset
-    obs = store._adata.obs
-    cond = obs["condition"].astype(str)
-    # Our folds are generated independently of the external (Miller-pipeline)
-    # DL drops, so DL≠ours is EXPECTED and reported as a finding, not a failure.
-    # This whole layer is scheduled for deletion at TRAINING_INFRA_PLAN M3, once
-    # in-repo container training produces DL predictions on our own folds.
-    hard = False
-    for scenario in DATASET_CONFIG[ds]["scenarios"]:
-        try:
-            fbm = get_model_folds(load_manifest(), ds, scenario)
-        except Exception as e:
-            r.skip(f"fold-align {ds}/{scenario}", f"manifest: {e}", intentional=True)
-            continue
-        if not fbm:
-            r.skip(f"fold-align {ds}/{scenario}", "no DL models in manifest",
-                   intentional=True)
-            continue
-        # our h5ad fold test sets
-        h5: Dict[int, Set[str]] = {}
-        f = 0
-        while split_obs_column(scenario, f) in obs.columns:
-            lbl = obs[split_obs_column(scenario, f)].astype(str).values
-            h5[f] = _canon_set(cond[lbl == "test"].unique())
-            f += 1
-        if not h5:
-            r.skip(f"fold-align {ds}/{scenario}", "no split columns in h5ad")
-            continue
-        if scenario == "UnseenCell":
-            r.skip(f"fold-align {ds}/{scenario}",
-                   "pert-degenerate (every fold tests all perts) — cell-axis only",
-                   intentional=True)
-            continue
-        for model, folds in fbm.items():
-            n_exact = 0
-            for fe in folds:
-                dl_set = _dl_declared_test_set(fe["predictions_path"])
-                if not dl_set:
-                    continue
-                # best h5ad fold by overlap; require exact equality
-                best = max(h5, key=lambda hf: len(dl_set & h5[hf]) / max(len(dl_set | h5[hf]), 1))
-                # PRESAGE emits a strict pert-subset (smaller vocabulary): restrict
-                # our side to the DL set's universe before requiring equality, so a
-                # coverage gap isn't read as a fold-assignment mismatch.
-                if model == "presage":
-                    exact = dl_set and dl_set <= h5[best]
-                else:
-                    exact = (dl_set == h5[best])
-                n_exact += int(bool(exact))
-            ok = n_exact == len(folds) and len(folds) > 0
-            label = f"fold-align {ds}/{scenario}/{model}: all DL folds map exactly"
-            if ok or hard:
-                r.check(label, ok, f"{n_exact}/{len(folds)} exact")
-            else:
-                r.info(f"{label}: {n_exact}/{len(folds)} exact — DL folds differ "
-                       "from ours (expected: the external drops were trained on the "
-                       "upstream pipeline's folds). Not a failure.")
+#
+# The DL-vs-our-h5ad fold-alignment gate that shared this section is gone with
+# the adapter tier: it existed to check that externally-computed predictions had
+# been produced on our folds. Predictors now train here, on our splits, so the
+# property is established by construction rather than audited after the fact.
 
 
 def verify_saved_prediction_alignment(store, r: Results) -> None:
@@ -1866,9 +1736,10 @@ def verify_saved_prediction_alignment(store, r: Results) -> None:
                            and int(npz.get("fold")) == 0
                            and str(npz.get("dataset")) == ds)
                 tki = set(int(i) for i in npz["test_ko_indices"])
-                # predictor's saved test KOs must be a subset of the split's test KOs
-                # (target-aware/combo predictors save the same axis; DL may subset)
-                tki_ok = tki <= exp_tki or p in _dl_model_key_map()
+                # A predictor's saved test KOs must be a subset of the split's.
+                # The adapter exemption that used to sit here is gone with the
+                # adapters: nothing subsets the axis for external reasons now.
+                tki_ok = tki <= exp_tki
                 r.check(f"pred-align {ds}/{scenario} {p}: metadata + test KOs match split",
                         meta_ok and tki_ok,
                         f"meta_ok={meta_ok} tki⊆split={tki <= exp_tki}")
@@ -1903,7 +1774,6 @@ def verify_dataset(dataset: str, r: Results, *,
     verify_pseudobulk_math(store, r)
     if full:
         verify_gt_axis(store, r)
-        verify_fold_alignment(store, r)
         verify_saved_prediction_alignment(store, r)
     verify_coverage(store, r, scenario)
 
@@ -1972,7 +1842,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     mode.add_argument("--fast", action="store_true",
                       help="L1,L2 (data) + L4 (contracts) + L5 (coverage). Default.")
     mode.add_argument("--full", action="store_true",
-                      help="adds L3 (GT-axis) + L6 (fold alignment); needs saved predictions.")
+                      help="adds L3 (GT-axis) + L6 (prediction alignment); needs saved predictions.")
     mode.add_argument("--contracts", action="store_true",
                       help="L4 predictor contracts only (no data files).")
     mode.add_argument("--coverage", action="store_true",
@@ -2042,7 +1912,7 @@ __all__ = [
     "DatasetValidationError", "validate_dataset",
     "Results", "preflight",
     "verify_dataset", "verify_predictor_contracts", "verify_coverage",
-    "verify_fold_alignment", "handles",
+    "verify_saved_prediction_alignment", "handles",
 ]
 
 

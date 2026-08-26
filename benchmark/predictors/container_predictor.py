@@ -2,9 +2,9 @@
 
 DL models are trained + inferred **inside our own leak-safe splits** and scored
 identically to baselines — there is no external-prediction adoption, no
-fold-alignment, no MANIFEST (that path, ``dl_adapter.py``, is deleted at M3).
-``fit`` trains in the model's ``.sif``; ``predict`` infers and maps the
-container's ``predictions.h5ad`` onto the benchmark delta tensor.
+fold-alignment, no MANIFEST. That path (``dl_adapter.py`` + ``_fold_align.py``)
+has been deleted. ``fit`` trains in the model's ``.sif``; ``predict`` infers and
+maps the container's ``predictions.h5ad`` onto the benchmark delta tensor.
 
 Combined-form feed (the atheus-native + only intake, verified GEARS+PRESAGE):
 the container is handed ONE combined h5ad (``data_path``) carrying the
@@ -18,10 +18,11 @@ per-model ``docker/<model>/model.yaml`` co-located with the model, loaded lazily
 attributes — those are read by ``verify`` in a pyyaml-less env, so they must not
 depend on the yaml.
 
-Transitional naming: while the old external-adoption predictors ``GEARS`` /
-``PRESAGE`` (``dl_adapter.py``) still coexist (through M2), the container-trained
-versions register under ``-ct`` names (``GEARS-ct`` / ``PRESAGE-ct``, "container
-trained"). M3 deletes the adapter and collapses the name.
+Naming: these register under ``-ct`` names (``GEARS-ct`` / ``PRESAGE-ct``,
+"container trained"), which dates from when the external-adoption ``GEARS`` /
+``PRESAGE`` predictors coexisted with them. Those are now deleted, so the suffix
+is free to be dropped — a rename that touches saved prediction paths and results
+CSVs, and so is deliberately not bundled with the deletion.
 """
 from __future__ import annotations
 
@@ -35,7 +36,8 @@ import numpy as np
 from benchmark.config import (
     h5ad_path, split_obs_column, predictor_dir, checkpoint_dir, parse_target_genes)
 from benchmark.data_loader import DatasetStore
-from benchmark.predictors.base import Predictor, register
+from benchmark.predictors.base import register
+from benchmark.predictors.trained import CLAIM_FILE, TrainedPredictor
 # Host-side glue for container predictors (moved out of docker/harness/ into this
 # package — imported normally, no sys.path shim). None of these import yaml at
 # module top, so importing this predictor stays safe in the pyyaml-less env.
@@ -56,7 +58,7 @@ COVARIATE_COLUMN = _config.COVARIATE_COLUMN
 # ===================================================================
 
 
-class ContainerPredictor(Predictor):
+class ContainerPredictor(TrainedPredictor):
     """Base for models trained in a vendored ``.sif`` on our leak-safe splits.
 
     A subclass declares its benchmark *capabilities* as plain class attributes —
@@ -69,14 +71,8 @@ class ContainerPredictor(Predictor):
     ``_preflight_model_specific``.
     """
 
-    needs_training = True
-    is_container_trained = True  # logic runs in the .sif → exempt from the L4 synthetic-contract meta-check
     # subclass-provided capability declaration (plain Python, read by verify):
     model_dir: str = ""          # repo-relative dir holding this model's model.yaml
-    cell_aware: bool = False
-    seed: int = 42
-    train_timeout: Optional[int] = None
-    predict_timeout: Optional[int] = None
 
     # -------- run recipe (lazy; from docker/<model>/model.yaml) --------
 
@@ -101,6 +97,7 @@ class ContainerPredictor(Predictor):
         if not path.exists():
             raise FileNotFoundError(f"{cls.name}: model recipe not found at {path}")
         recipe = yaml.safe_load(path.read_text())
+        _validate_recipe(recipe, f"{cls.name} ({path})")
         cls._recipe_cache = recipe
         return recipe
 
@@ -129,12 +126,38 @@ class ContainerPredictor(Predictor):
         return self._recipe()["model_key"]
 
     @property
+    def train_timeout(self) -> int:
+        """Seconds before a hung training run is killed. Required in the recipe:
+        without it a wedged container holds the GPU until SLURM reaps the job."""
+        return int(self._recipe()["train_timeout"])
+
+    @property
+    def predict_timeout(self) -> int:
+        return int(self._recipe()["predict_timeout"])
+
+    @property
     def extra_config(self) -> Dict:
-        """Model-specific keys injected into the container ``config.json``."""
-        recipe = self._recipe()
-        extra: Dict = {}
-        if recipe.get("gene2go_path"):
-            extra["gene2go_path"] = recipe["gene2go_path"]
+        """Model-specific keys injected verbatim into the container ``config.json``.
+
+        Declared as one ``extra_config:`` mapping in ``model.yaml`` rather than as
+        named top-level recipe keys. That matters now that unknown recipe keys are
+        an error (:func:`_validate_recipe`): naming them individually would grow
+        ``_OPTIONAL_RECIPE_KEYS`` into a union of every model's private vocabulary
+        — GEARS' ``gene2go_path``, PRESAGE's ``presage_cache_path``, scGPT's next —
+        and the "closed schema" would mean nothing. One escape hatch instead, so
+        the schema above it stays genuinely closed.
+
+        Values must be JSON scalars: this dict is hashed into the run fingerprint
+        (``_recipe_fingerprint``) and written into ``config.json``, so a nested or
+        unserialisable value fails late and confusingly.
+        """
+        extra = dict(self._recipe().get("extra_config") or {})
+        bad = {k: type(v).__name__ for k, v in extra.items()
+               if not isinstance(v, (str, int, float, bool))}
+        if bad:
+            raise ValueError(
+                f"{self.name}: model.yaml extra_config values must be JSON scalars; "
+                f"got {bad}")
         return extra
 
     # -------- paths --------
@@ -152,27 +175,12 @@ class ContainerPredictor(Predictor):
         """Resolve repo-relative code bind sources to absolute host paths."""
         return {str(REPO_ROOT / src): dest for src, dest in self.code_binds.items()}
 
-    def _run_dir(self, store: DatasetStore, scenario: str, fold: int) -> Path:
-        """This fold's checkpoint dir — written by fit, read by predict.
-
-        Delegates to ``config.checkpoint_dir`` so the path is defined in exactly
-        one place; the scored ``predictions.npz`` always stays under
-        ``predictor_dir`` via the inherited ``save_predictions``.
-        """
-        return checkpoint_dir(store.dataset, self.name, scenario, fold)
-
     def _data_dir(self, store: DatasetStore) -> Path:
         return Path(h5ad_path(store.dataset)).parent
 
     # -------- gates --------
 
-    def _check_scenario(self, scenario: str) -> None:
-        if scenario not in self.scenarios:
-            raise ValueError(
-                f"{self.name} does not support scenario {scenario!r} "
-                f"(supports {self.scenarios})")
-
-    def _leakage_gate(self, store: DatasetStore, scenario: str, fold: int) -> dict:
+    def _leakage_gate(self, store: DatasetStore, scenario: str, fold: int) -> None:
         report = leakage.assert_leak_safe_columns(
             h5ad_path(store.dataset), split_obs_column(scenario, fold),
             regime=scenario, covariate_col=COVARIATE_COLUMN)
@@ -183,7 +191,6 @@ class ContainerPredictor(Predictor):
         log.info("%s leakage gate OK (%s mode, %d test units, 0 leaked) — %s/%s/fold%d",
                  self.name, report["mode"], report["n_test_units"],
                  store.dataset, scenario, fold)
-        return report
 
     def _preflight(self, store: DatasetStore, scenario: str, fold: int) -> None:
         """Cheap correctness asserts before training (§6 Preflight)."""
@@ -203,6 +210,26 @@ class ContainerPredictor(Predictor):
             problems.append("no control cells (condition ∈ {control,ctrl,ctrl_iegfp})")
         elif not (ctrl_mask & (split == "train")).any():
             problems.append("no control cell labelled 'train' — basal starved")
+
+        # The covariate column is ASSUMED throughout (_container/config.py always
+        # sends `covariate_key=cell_type`, leakage.py checks pairs on it). For a
+        # cell-blind model a missing column is cosmetic; for a `cell_aware` one it
+        # is not — the container falls back to a degenerate covariate and the model
+        # quietly stops conditioning while still producing cell-axis numbers. So
+        # the strength of the check follows the claim.
+        if COVARIATE_COLUMN not in obs.columns:
+            msg = f"obs has no {COVARIATE_COLUMN!r} column"
+            if self.cell_aware:
+                problems.append(msg + " — a cell_aware model cannot condition on it")
+            else:
+                log.warning("%s: %s (model is not cell_aware; continuing)", self.name, msg)
+        elif self.cell_aware and scenario in leakage.BIN_AXIS_REGIMES:
+            n_cov = obs[COVARIATE_COLUMN].astype(str).nunique()
+            if n_cov < 2:
+                problems.append(
+                    f"{COVARIATE_COLUMN!r} has {n_cov} distinct value(s) — a "
+                    f"cell-axis regime ({scenario}) needs ≥2, and the wrapper "
+                    f"silently disables covariate conditioning below that")
 
         # U5: split tokens must include train/val/test.
         tokens = set(split.unique())
@@ -251,77 +278,58 @@ class ContainerPredictor(Predictor):
 
     def _expected_artifacts(self) -> List[str]:
         """Run-dir-relative paths that must ALL exist for the run to count as
-        trained. Declared per model in its ``model.yaml`` (``expected_artifacts``)."""
-        return list(self._recipe().get("expected_artifacts", []))
+        trained. Declared per model in its ``model.yaml``.
 
-    def missing_artifacts(self, store: DatasetStore, scenario: str, fold: int) -> List[str]:
-        """Which expected artefacts are absent from this fold's run dir."""
-        run_dir = self._run_dir(store, scenario, fold)
-        return [rel for rel in self._expected_artifacts() if not (run_dir / rel).exists()]
+        Required, not defaulted: an empty list would make ``missing_artifacts``
+        return nothing, so an EMPTY run dir would report itself trained and
+        ``fit``'s post-condition would pass after a crash.
+        """
+        artifacts = self._recipe()["expected_artifacts"]
+        if not artifacts:
+            raise ValueError(
+                f"{self.name}: model.yaml declares an empty `expected_artifacts` "
+                f"— then nothing distinguishes a trained run from an empty dir")
+        return list(artifacts)
 
-    def _gene_axis_mismatch(
-        self, store: DatasetStore, scenario: str, fold: int,
-    ) -> Optional[str]:
-        """Was the checkpoint trained on a different gene axis than the dataset
-        now has? Returns a reason string, or None if the axes agree.
+    def _recipe_fingerprint(self) -> Dict:
+        """The recipe fields that change what training produces.
 
-        A dataset rebuild that changes the panel silently invalidates every
-        checkpoint trained before it. GEARS does not notice until deep inside
-        ``forward()``, where it dies on a tensor-size mismatch after the graph
-        build — minutes of GPU time to learn the run was doomed."""
-        rel = self._recipe().get("gene_axis_artifact")
-        if not rel:
-            return None
-        path = self._run_dir(store, scenario, fold) / rel
-        if not path.exists():
-            return None                       # already reported as a missing artefact
-        import h5py                           # deferred: keeps the registry env-independent
-        with h5py.File(str(path), "r") as f:
-            raw = f["var/_index"][:]
-        trained = sorted(g.decode() if isinstance(g, bytes) else str(g) for g in raw)
-        current = sorted(store.gene_names)
-        if trained == current:
-            return None
-        return (f"trained on a different gene axis ({len(trained)} genes) than "
-                f"{store.dataset} now has ({len(current)}) — the dataset was "
-                f"rebuilt after this checkpoint; retrain with --force")
+        Everything the container is told to do, minus the plumbing (paths, mounts,
+        the W&B project) which does not alter the model.
+        """
+        recipe = self._recipe()
+        return {"model_key": recipe["model_key"],
+                "hyperparameters": recipe["hyperparameters"],
+                "extra_config": self.extra_config}
 
-    def unusable_reason(
-        self, store: DatasetStore, scenario: str, fold: int,
-    ) -> Optional[str]:
-        """Why this checkpoint cannot be used, or None if it can."""
-        missing = self.missing_artifacts(store, scenario, fold)
-        if missing:
-            return f"missing artefacts {missing}"
-        return self._gene_axis_mismatch(store, scenario, fold)
+    def _clean_run_dir(self, run_dir: Path) -> None:
+        """Train from a clean dir: GEARS reuses whatever cache it finds, so a
+        stale `processed_data/` would be silently trained against.
 
-    def is_trained(self, store: DatasetStore, scenario: str, fold: int) -> bool:
-        """True when the checkpoint is both complete AND still valid for this data.
+        Wipes the CONTENTS, not the directory — `fit` has already created it and
+        taken the claim inside it, and deleting the claim is what let two
+        concurrent runs train into one dir. `processed_data/` is itself a
+        directory, so this needs `rmtree` per child; a flat `unlink` loop would
+        raise `IsADirectoryError` on precisely the cache this exists to remove.
+        """
+        for child in run_dir.iterdir():
+            if child.name == CLAIM_FILE:
+                continue
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
 
-        Checks the real artefacts (weights AND the processed cache that GEARS'
-        predict path loads-or-raises), not a placeholder file: the old
-        ``weights.npz``-exists gate reported "trained" while the run dir was
-        gone, so ``predict`` either retrained silently or died mid-run."""
-        return self.unusable_reason(store, scenario, fold) is None
-
-    def fit(self, store: DatasetStore, scenario: str, fold: int) -> None:
-        self._check_scenario(scenario)
-        self._preflight(store, scenario, fold)
-        self._leakage_gate(store, scenario, fold)
-
-        run_dir = self._run_dir(store, scenario, fold)
-        if run_dir.exists():                          # B4: fresh dir, no stale cache
-            shutil.rmtree(run_dir)
-        run_dir.mkdir(parents=True, exist_ok=True)
-
+    def _train(self, store: DatasetStore, scenario: str, fold: int,
+               run_dir: Path) -> Optional[Dict]:
         cfg = _config.build_config(
             "train", dataset=store.dataset, scenario=scenario, fold=fold,
-            model_name=self.model_yaml_key, seed=self.seed,
+            model_name=self.model_yaml_key, seed=self._seed_for(fold),
             hyperparameters=self.default_hyperparameters, extra_config=self.extra_config)
         if self.wandb_project:                        # opt-in W&B training logs (train only)
             cfg["wandb"] = True
             cfg["wandb_project"] = self.wandb_project
-            cfg["wandb_run"] = f"{self.name}_{store.dataset}_{scenario}_fold{fold}_seed{self.seed}"
+            cfg["wandb_run"] = f"{self.name}_{store.dataset}_{scenario}_fold{fold}_seed{self._seed_for(fold)}"
         _contract.validate_train_config(dict(cfg))    # host-side schema gate
 
         log.info("%s: training %s/%s/fold%d in %s", self.name, store.dataset,
@@ -330,29 +338,25 @@ class ContainerPredictor(Predictor):
             self._sif(), "train", cfg, data_dir=self._data_dir(store),
             output_dir=run_dir, code_binds=self._code_binds(), entry=self.entry,
             timeout=self.train_timeout)
+        return self._train_report(run_dir)
 
-        missing = self.missing_artifacts(store, scenario, fold)   # B3
-        if missing:
-            raise RuntimeError(
-                f"{self.name}: training finished but left an unusable run dir at "
-                f"{run_dir} — missing {missing}. Failing here rather than at predict, "
-                f"where the cause would be far from the crash.")
+    def _train_report(self, run_dir: Path) -> Optional[Dict]:
+        """Training provenance the container left behind, for ``fingerprint.json``.
 
-    def predict(self, store: DatasetStore, scenario: str, fold: int) -> np.ndarray:
-        self._check_scenario(scenario)
-        run_dir = self._run_dir(store, scenario, fold)
-        reason = self.unusable_reason(store, scenario, fold)       # B3
-        if reason:
-            raise RuntimeError(
-                f"{self.name}: no usable trained model at {run_dir} — {reason}. "
-                f"Run `fit` (or `all`) first; predict never trains.")
+        Default None: a container that records nothing is not an error. Subclasses
+        that do (best epoch, val loss, what was held out) lift it here — see
+        :class:`PRESAGEContainer`.
+        """
+        return None
 
+    def _infer(self, store: DatasetStore, scenario: str, fold: int,
+               run_dir: Path) -> np.ndarray:
         preds_h5ad = run_dir / "predictions.h5ad"
         if preds_h5ad.exists():
             preds_h5ad.unlink()
         cfg = _config.build_config(
             "predict", dataset=store.dataset, scenario=scenario, fold=fold,
-            model_name=self.model_yaml_key, seed=self.seed,
+            model_name=self.model_yaml_key, seed=self._seed_for(fold),
             hyperparameters=self.default_hyperparameters, extra_config=self.extra_config,
             output_path_host=str(preds_h5ad))
         _contract.validate_predict_config(dict(cfg))
@@ -366,13 +370,10 @@ class ContainerPredictor(Predictor):
         if not preds_h5ad.exists():
             raise RuntimeError(f"{self.name}: predict wrote no {preds_h5ad}")
 
-        deltas = tensor_map.load_and_map(
+        # `load_and_map` places the container's output onto the store's canonical
+        # (bin, ko, gene) axes by NAME; the template then validates the shape.
+        return tensor_map.load_and_map(
             preds_h5ad, store, scenario, fold, model_name=self.name)
-        if not np.isfinite(deltas).any():
-            raise RuntimeError(
-                f"{self.name}: all-NaN delta tensor for {store.dataset}/{scenario}/"
-                f"fold{fold} — condition/covariate mapping mismatch?")
-        return deltas
 
 
 # ===================================================================
@@ -429,4 +430,85 @@ class GEARSContainer(ContainerPredictor):
                 f"gene-ID space mismatch, not a benign drop. Dropped e.g. {dropped[:10]}")
 
 
-__all__ = ["ContainerPredictor", "GEARSContainer", "COVARIATE_COLUMN"]
+@register
+class PRESAGEContainer(ContainerPredictor):
+    """PRESAGE (Genentech) trained in-container on our leak-safe splits.
+
+    The first genuinely covariate-aware container model: it pseudobulks per
+    ``(cell_type, perturbation)`` and adds a covariate embedding to the
+    perturbation latent, so it can claim the cell-axis regimes GEARS cannot.
+
+    Being *able* to claim them is not evidence it uses them. Before any cell-axis
+    number is reported, the M1.5 gate must pass on replogle22/UnseenBoth: the
+    pair-mode leakage check AND a cell-type-dependent positive control (the same
+    KO under K562 and RPE1 must predict *differently*). If the covariate
+    conditioning is inert they come out identical, and "it ran without leaking"
+    would not have caught it. See docker/presage/TRAINING_VALIDATION.md.
+    """
+
+    name = "PRESAGE-ct"
+    model_dir = "docker/presage"      # holds model.yaml (the run recipe)
+    cell_aware = True                 # conditions on cell_type; gated by M1.5 (above)
+    scenarios = ["UnseenPert", "UnseenCell", "UnseenBoth", "UnseenPair", "UnseenCombo"]
+    has_drop_rule = False             # no prior-knowledge vocabulary drops perturbations
+
+    def _train_report(self, run_dir: Path) -> Optional[Dict]:
+        """Lift the wrapper's training report into ``fingerprint.json``.
+
+        Records which epoch was actually selected and what the run held out —
+        the two things the host-side fingerprint (a hash of the split) cannot
+        show a reader auditing a cell-axis run.
+        """
+        import json
+        path = run_dir / "presage_training_hparams.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text()).get("report")
+        except (OSError, ValueError) as e:
+            log.warning("%s: unreadable %s (%s) — no training report recorded",
+                        self.name, path.name, e)
+            return None
+
+
+__all__ = ["ContainerPredictor", "GEARSContainer", "PRESAGEContainer",
+           "COVARIATE_COLUMN"]
+
+
+# ---------------------------------------------------------------------------
+# Recipe schema
+# ---------------------------------------------------------------------------
+
+#: Keys a `model.yaml` MUST declare.
+_REQUIRED_RECIPE_KEYS = frozenset({
+    "model_key", "sif_path", "entry", "code_binds", "hyperparameters",
+    "expected_artifacts", "train_timeout", "predict_timeout",
+})
+#: Keys it MAY declare. Model-specific container config goes under the single
+#: ``extra_config`` mapping (see ``ContainerPredictor.extra_config``) — never as a
+#: new top-level key, which would make this set a union of every model's private
+#: vocabulary and defeat the unknown-key check below.
+_OPTIONAL_RECIPE_KEYS = frozenset({"wandb_project", "extra_config"})
+
+
+def _validate_recipe(recipe: Dict, where: str) -> None:
+    """Reject a malformed recipe at load time, not mid-run.
+
+    Unknown keys are an ERROR rather than ignored: the recipe is meant to be the
+    single source of truth for how a model is run, and a silently-dropped typo
+    (`epochs` under the wrong nesting, say) would leave that claim false while
+    the model trains with defaults nobody chose.
+    """
+    if not isinstance(recipe, dict):
+        raise ValueError(f"{where}: model.yaml must be a mapping")
+    keys = set(recipe)
+    missing = _REQUIRED_RECIPE_KEYS - keys
+    if missing:
+        raise ValueError(f"{where}: model.yaml is missing required key(s) "
+                         f"{sorted(missing)}")
+    unknown = keys - _REQUIRED_RECIPE_KEYS - _OPTIONAL_RECIPE_KEYS
+    if unknown:
+        raise ValueError(
+            f"{where}: model.yaml has unrecognised key(s) {sorted(unknown)}. "
+            f"Known: {sorted(_REQUIRED_RECIPE_KEYS | _OPTIONAL_RECIPE_KEYS)}. "
+            f"Add it to the schema in container_predictor.py if it is real.")

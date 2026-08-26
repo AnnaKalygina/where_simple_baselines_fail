@@ -71,6 +71,15 @@ wandb/
 # === Notes / planning docs ===
 # Design notes and plans stay local — the repo carries code, not notes.
 *.md
+# ...but everything under docker/ is interface, not planning notes, and a fresh
+# clone needs all of it: the host<->container contract every wrapper is written
+# against, the image build definitions, the per-model design notes, the
+# training-validation cards that are our evidence a container trains its model
+# correctly, and — for PRESAGE, which is Genentech Non-Commercial — the
+# MODIFICATIONS.md its NOTICE requires to travel with the code. A clone carrying
+# the licence but not the disclosure is a licensing problem, not a docs gap.
+!docker/**/*.md
+!README.md
 
 # === Synthetic dataset + depth-hypothesis work (excluded for now) ===
 data/ecoli_synthetic/

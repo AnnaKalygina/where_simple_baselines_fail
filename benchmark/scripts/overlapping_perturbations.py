@@ -57,28 +57,8 @@ from benchmark.config import RESULTS_DIR
 from benchmark.data_loader import DatasetStore
 from benchmark.config import parse_target_genes
 from benchmark.meta_metrics import overlap_perturbations
-from benchmark.predictors.dl_adapter import get_model_folds, load_manifest
-
-# Predictor-name (as in metrics.csv) -> MANIFEST model key (lowercase).
-DL_MODEL_MAP = {"GEARS": "gears", "PRESAGE": "presage", "scGPT": "scgpt"}
-
-# Legacy results-dir scenario codes -> canonical PascalCase used by the manifest
-# (mirrors dl_adapter.LEGACY_TO_PASCAL) so DL reasons resolve for either naming.
-SCENARIO_ALIAS = {"S1": "UnseenPert", "S2": "UnseenCell", "S3": "UnseenBoth",
-                  "S4": "UnseenPair", "S5": "UnseenDose", "S6": "UnseenCombo"}
 
 REASON_CODES = {
-    "gene_not_modeled": "Target gene is not in the DL model's modeled gene set (the genes "
-                        "in its predictions output, var_names); the model cannot predict a "
-                        "perturbation of a gene it does not model. (NB: this is NOT scGPT's "
-                        "60k token vocabulary, which contains nearly all genes — it is the "
-                        "much smaller per-dataset modeled feature set.)",
-    "pert_not_supported": "Target gene IS among the DL model's modeled output genes, yet the "
-                          "model emitted no prediction for it as a perturbation — it is outside "
-                          "the model's supported perturbation set (e.g. GEARS can only perturb "
-                          "genes present in its GO/co-expression graph).",
-    "fold_mismatch": "The DL model predicts this gene, but in a different fold than "
-                     "our split assigned, so it was never scored for this cell.",
     "target_not_in_panel": "Target gene(s) are absent from this dataset's gene panel; "
                            "the target-aware predictor skips perturbations it cannot resolve.",
     "single_gene_only": "Predictor handles single-gene perturbations only; this label "
@@ -95,21 +75,8 @@ REASON_CODES = {
 _GLOBAL = "_global_"
 
 
-def _is_ctrl(label: str) -> bool:
-    low = str(label).lower()
-    return ("control" in low) or ("ctrl" in low)
-
-
-def _norm(label: str) -> str:
-    """Order-insensitive canonical form of a perturbation label for matching
-    our ko_names against DL source condition labels (strips @dose, sorts the
-    +/; target tokens)."""
-    return "+".join(sorted(parse_target_genes(label)))
-
-
 # ---- cached, reused across scenario iterations ------------------------------
 _STORE_CACHE: Dict[Tuple[str, str], Optional[DatasetStore]] = {}
-_DL_INFO_CACHE: Dict[Tuple[str, str], Dict[str, Dict[str, Set[str]]]] = {}
 
 
 def get_store(dataset: str) -> Optional[DatasetStore]:
@@ -123,82 +90,14 @@ def get_store(dataset: str) -> Optional[DatasetStore]:
     return _STORE_CACHE[key]
 
 
-def dl_model_info(dataset: str, scenario: str) -> Dict[str, Dict[str, Set[str]]]:
-    """{manifest_model_lower: {"genes": modeled-gene-set (union of predictions var
-    across folds), "preds": normalized conditions predicted across all folds}}.
-
-    Panel-independent (gene-name aligned), so computed once per (ds, sc). Both the
-    modeled gene set and predicted set come from the model's source predictions
-    h5ad(s) — the authoritative record of what each DL model can model/predict.
-    """
-    import anndata as ad
-    scenario = SCENARIO_ALIAS.get(scenario, scenario)  # legacy S1-S4 -> PascalCase
-    key = (dataset, scenario)
-    if key in _DL_INFO_CACHE:
-        return _DL_INFO_CACHE[key]
-    out: Dict[str, Dict[str, Set[str]]] = {}
-    try:
-        fbm = get_model_folds(load_manifest(), dataset, scenario)
-    except Exception as e:
-        print(f"  WARN: manifest lookup failed for {dataset}/{scenario}: {e}")
-        fbm = {}
-    for model, folds in fbm.items():
-        genes: Set[str] = set()
-        preds: Set[str] = set()
-        for f in folds:
-            try:
-                h = ad.read_h5ad(str(f["predictions_path"]), backed="r")
-                try:
-                    genes |= {str(g) for g in h.var_names}
-                    col = "condition" if "condition" in h.obs.columns else h.obs.columns[0]
-                    preds |= {_norm(c) for c in h.obs[col].astype(str).unique()
-                              if not _is_ctrl(c)}
-                finally:
-                    try:
-                        h.file.close()
-                    except Exception:
-                        pass
-            except Exception as e:
-                print(f"  WARN: read source preds {model} {dataset}/{scenario}: {e}")
-        out[model] = {"genes": genes, "preds": preds}
-    _DL_INFO_CACHE[key] = out
-    return out
-
-
 # ---- reason engine ----------------------------------------------------------
 def explain(predictor: str, ko: str, dataset: str, scenario: str,
             ) -> Dict[str, str]:
     """Why `predictor` did not produce a valid prediction for `ko`."""
-    # 1) DL models — diagnose from the model's source outputs
-    if predictor in DL_MODEL_MAP:
-        info = dl_model_info(dataset, scenario).get(DL_MODEL_MAP[predictor], {})
-        genes = info.get("genes", set())
-        preds = info.get("preds", set())
-        if _norm(ko) in preds:
-            return {"reason": "fold_mismatch",
-                    "explanation": f"{predictor} predicts '{ko}', but in a different "
-                                   f"fold than our split assigned, so it was not scored."}
-        tokens = parse_target_genes(ko)
-        missing = [t for t in tokens if t not in genes]
-        if genes and missing:
-            return {"reason": "gene_not_modeled",
-                    "explanation": f"Target gene(s) {missing} of '{ko}' are not in "
-                                   f"{predictor}'s modeled gene set ({len(genes)} genes); "
-                                   f"the model cannot predict a perturbation of a gene it "
-                                   f"does not model."}
-        # gene IS modeled (or gene set unknown) but no prediction emitted
-        hint = (" GEARS can only perturb genes present in its GO/co-expression graph."
-                if predictor == "GEARS" else "")
-        return {"reason": "pert_not_supported",
-                "explanation": f"{predictor} emitted no prediction for '{ko}' in any fold "
-                               f"although its target gene(s) ARE among {predictor}'s "
-                               f"{len(genes)} modeled output genes — the perturbation is "
-                               f"outside {predictor}'s supported perturbation set.{hint}"}
-
-    # 2) non-DL predictors — the DROP DECISION is single-sourced in
-    #    `verify.handles()` (the inverse of this function). Here we only FORMAT
-    #    the human-readable reason for the code it returns, so the rule logic
-    #    lives in exactly one place (core), not duplicated in this script.
+    # 1) The DROP DECISION is single-sourced in `verify.handles()` (the inverse
+    #    of this function). Here we only FORMAT the human-readable reason for the
+    #    code it returns, so the rule logic lives in exactly one place (core),
+    #    not duplicated in this script.
     store = get_store(dataset)
     if store is not None:
         from benchmark.verify import handles
@@ -207,7 +106,7 @@ def explain(predictor: str, ko: str, dataset: str, scenario: str,
             return {"reason": code,
                     "explanation": _reason_text(code, predictor, ko, store)}
 
-    # 3) handles() says it should resolve (or the store is unavailable) yet the
+    # 2) handles() says it should resolve (or the store is unavailable) yet the
     #    perturbation is absent from coverage → honest catch-all.
     return {"reason": "no_valid_prediction",
             "explanation": f"{predictor} produced no valid prediction for '{ko}' "
