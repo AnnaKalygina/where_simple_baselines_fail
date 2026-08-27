@@ -320,6 +320,20 @@ class CellSimBenchDataModule(PRESAGEDataModule):
                 cov_full = full_adata_ctrl_source[full_adata_ctrl_source.obs[cov_field] == cov_val]
                 row_label = cov_val
 
+            # VENDORED (V19): a covariate can be legitimately ABSENT from a split.
+            # replogle22 UnseenBoth fold0 has val = K562-only and test = RPE1-only
+            # (measured), so iterating every cov_category over every split
+            # necessarily hits empty ones. The original fell through to the
+            # perturbation loop and raised "No perturbations found for cov=RPE1",
+            # killing the run (job 9532957). Skipping is consistent with
+            # create_dataset, which already skips a covariate with no cells in the
+            # split, and it loses nothing: there is no data for this covariate here.
+            if cov_val is not None and len(cov_adata) == 0:
+                log.info(
+                    f"[cov={row_label}] no cells in this split — skipping "
+                    f"(absent from this split by construction, not an error)")
+                continue
+
             ctrl_cells = cov_adata[cov_adata.obs[self.perturb_field] == self.control_key]
             if len(ctrl_cells) == 0:
                 # Fall back to controls from the full adata, restricted to this covariate.
@@ -361,12 +375,28 @@ class CellSimBenchDataModule(PRESAGEDataModule):
                 perturbations_included.append(pert)
 
             if len(pert_means_list) == 0:
-                raise ValueError(f"No perturbations found for cov={row_label}")
-            perturbation_means[row_label] = np.mean(np.array(pert_means_list), axis=0)
-            log.info(
-                f"[cov={row_label}] computed perturbation mean using "
-                f"{len(perturbations_included)} perturbations"
-            )
+                # VENDORED (V19): fatal ONLY if the value is actually used. Under
+                # V7 `perts_as_delta_ref` is pinned False, so `perturbation_mean`
+                # is stored on the dataset and never read (the sole reader is the
+                # `if self.perts_as_delta_ref:` branch in create_dataset). Killing
+                # a run over a dead quantity is the wrong trade; NaN makes it fail
+                # loudly if anything ever does read it.
+                if self.perts_as_delta_ref:
+                    raise ValueError(
+                        f"No perturbations found for cov={row_label}, and "
+                        f"perts_as_delta_ref=True needs it as the delta reference")
+                log.warning(
+                    f"[cov={row_label}] has cells in this split but no non-control "
+                    f"perturbations; perturbation mean recorded as NaN (unused "
+                    f"under perts_as_delta_ref=False)")
+                perturbation_means[row_label] = np.full(
+                    adata.shape[1], np.nan, dtype=np.float32)
+            else:
+                perturbation_means[row_label] = np.mean(np.array(pert_means_list), axis=0)
+                log.info(
+                    f"[cov={row_label}] computed perturbation mean using "
+                    f"{len(perturbations_included)} perturbations"
+                )
 
         index = list(control_means.keys())  # preserves the order of cov_values
         var_index = adata.var.index

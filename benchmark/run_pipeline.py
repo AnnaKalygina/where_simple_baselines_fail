@@ -33,8 +33,8 @@ import pandas as pd
 
 from benchmark.config import (
     DATASET_CONFIG, RESULTS_DIR,
-    enumerate_jobs, existing_predictions_path, predictions_path, predictor_dir,
-    results_fold_dir, results_pooled_dir,
+    checkpoint_dir, enumerate_jobs, existing_predictions_path, predictions_path,
+    predictor_dir, results_fold_dir, results_pooled_dir,
 )
 from benchmark.data_loader import DatasetStore
 from benchmark.meta_metrics import (
@@ -48,6 +48,7 @@ from benchmark.predictors.base import (
     PREDICTOR_REGISTRY, _ensure_predictors_loaded, needs_training,
     predictor_category)
 from benchmark.predictors.learned import LearnedPredictor
+from benchmark.predictors._shared import FINGERPRINT_FILE
 from benchmark.predictors.trained import TrainedPredictor
 
 log = logging.getLogger(__name__)
@@ -330,6 +331,18 @@ def cmd_fit(args) -> None:
                 log.info("skip %s/%s/fold%d %s (not in scenarios)", ds, sc, fold, p)
                 continue
             model = cls()
+            if isinstance(model, TrainedPredictor) and getattr(args, "seed", None):
+                model.seed = args.seed
+                # Never wipe another seed's run: `fit` clears the run dir, and a
+                # seed mismatch reads as ordinary staleness, which retrains
+                # without --force. Neither run supersedes the other, so refuse.
+                other = _foreign_seed(ds, p, sc, fold, model.seed)
+                if other is not None:
+                    log.error("FIT %s/%s/fold%d %s: run dir holds seed %d, "
+                              "refusing to overwrite it with seed %d — point "
+                              "VCELL_ROOT at a different tree",
+                              ds, sc, fold, p, other, model.seed)
+                    continue
             if (needs_training(cls) and not getattr(args, "force", False)
                     and model.is_trained(store, sc, fold)):
                 log.info("FIT %s/%s/fold%d %s: trained state already present — "
@@ -372,6 +385,8 @@ def cmd_predict(args) -> None:
             # fold is skipped with a clear message; previously a stale/empty
             # weights.npz made this branch either retrain silently or crash.
             model = cls()
+            if isinstance(model, TrainedPredictor) and getattr(args, "seed", None):
+                model.seed = args.seed
             if needs_training(cls) and not model.is_trained(store, sc, fold):
                 log.warning("PREDICT %s/%s/fold%d %s: not trained — run `fit` "
                             "(or `all`) first; skipping", ds, sc, fold, p)
@@ -662,6 +677,50 @@ def cmd_summary(args) -> None:
         log.info("Wrote %s (%d rows)", opath, len(summ))
 
 
+def _require_seed_isolation(args) -> None:
+    """A non-default seed must run in a tree of its own. Refuses otherwise.
+
+    Everything under `models/{ds}/{pred}/{sc}/fold{N}/` is seed-INDEPENDENT: the
+    checkpoint dir, `predictions.npz`, and the `metrics.csv` rows are all keyed on
+    the predictor NAME. So a second seed run against the default tree does not sit
+    beside the first — `fit` wipes the run dir (`_clean_run_dir`), then `predict`
+    overwrites `predictions.npz`, then `metrics` overwrites the scored rows. A
+    stale fold retrains WITHOUT `--force`, so nothing else stops it either.
+
+    The alternative — a seed segment in `checkpoint_dir` — is a breaking change to
+    every existing checkpoint path and a decision belonging to whoever owns the
+    trained-tier layout. This flag is for one-off seed-stability runs, so it asks
+    for isolation instead of inventing a second way to address a run.
+    """
+    if getattr(args, "seed", None) is None:
+        return
+    if not os.environ.get("VCELL_ROOT"):
+        sys.exit(
+            "--seed needs VCELL_ROOT set to a separate tree, or this run would\n"
+            "overwrite the default seed's checkpoint, predictions and metrics\n"
+            "rather than sit beside them (they are all addressed by predictor\n"
+            "name, not by seed). For example:\n\n"
+            "  mkdir -p $SCRATCH/seed43 && ln -s $PWD/data $SCRATCH/seed43/data\n"
+            "  VCELL_ROOT=$SCRATCH/seed43 python -m benchmark.run_pipeline all \\\n"
+            "      --dataset adamson16 --scenario UnseenPert --fold 0 \\\n"
+            "      --predictor GEARS-ct --seed 43")
+
+
+def _foreign_seed(ds: str, p: str, sc: str, fold: int, seed: int) -> Optional[int]:
+    """The seed already recorded in this run dir, when it is not `seed`.
+
+    The precise backstop to `_require_seed_isolation`'s blunt one: it also fires
+    when an isolated tree is reused for a second seed, which is an easy mistake to
+    make and destroys a run that costs GPU-hours.
+    """
+    try:
+        stored = json.loads(
+            (checkpoint_dir(ds, p, sc, fold) / FINGERPRINT_FILE).read_text()).get("seed")
+    except (OSError, ValueError):
+        return None
+    return int(stored) if stored is not None and int(stored) != int(seed) else None
+
+
 def cmd_all(args) -> None:
     cmd_fit(args)
     cmd_predict(args)
@@ -748,6 +807,14 @@ def build_parser() -> argparse.ArgumentParser:
                                   "answers 'retrain an already-trained fold?', this "
                                   "answers 'collide with a live run?'. A claim older "
                                   "than the model's timeout is reclaimed without it.")
+        if name in {"fit", "predict", "all"}:
+            ssp.add_argument("--seed", type=int, default=None,
+                             help="train/score a trained predictor under this seed "
+                                  "instead of its default. Requires VCELL_ROOT to "
+                                  "point at a separate tree: run dirs, predictions "
+                                  "and metrics rows are addressed by predictor name, "
+                                  "not by seed, so a second seed would overwrite the "
+                                  "first in place. For one-off seed-stability runs.")
         if name in {"fit", "all"}:
             ssp.add_argument("--no-verify", action="store_true",
                              help="skip the pre-benchmark L0+L1 preflight")
@@ -769,6 +836,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Before any work: a non-default seed that would land on the default tree is
+    # refused here rather than discovered after the wipe.
+    _require_seed_isolation(args)
     args.func(args)
     return 0
 

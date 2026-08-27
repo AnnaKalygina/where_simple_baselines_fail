@@ -708,11 +708,21 @@ class PRESAGEWrapper:
                 f"Renaming them would silently drop those genes from the benchmark "
                 f"gene axis — fix the gene axis in the dataset build instead.")
         
-        # Ensure X is dense array
+        # Ensure X is dense array.
+        # VENDORED (V18): `copy=False` on the astype. The original always copied,
+        # so for an already-float32 input this allocated a SECOND full dense array
+        # for no benefit. On replogle22 (504,932 x 7,226, 44.5% dense, 1.62e9 nnz)
+        # one dense float32 copy is 14.6 GB, and the sparse CSR it is built from is
+        # another 13 GB — job 9532031 was OOM-killed at 96 GB right here. The
+        # stored dtype IS float32 (verified in the h5ad), so this copy was pure
+        # waste; where the input is not float32 the conversion still happens.
+        # This does NOT make the load cheap: `load_preprocessed` densifies the
+        # whole input a second time on read, which is inherent to the datamodule
+        # and is what sets --mem. See PRESAGE_NOTES.md section 4 (Memory).
         if hasattr(adata.X, 'toarray'):
             adata.X = adata.X.toarray()
-        
-        adata.X = adata.X.astype(np.float32)
+
+        adata.X = adata.X.astype(np.float32, copy=False)
         
         log.info("Converted data to PRESAGE format")
         return adata
