@@ -1,0 +1,98 @@
+# PRESAGE-ct run recipe — the single source of truth for how the PRESAGE container
+# is trained and run. Read lazily by benchmark.predictors.container_predictor.
+# PRESAGEContainer (via ContainerPredictor._recipe). Benchmark *capabilities*
+# (scenarios, cell_aware, has_drop_rule) are declared in Python on the predictor
+# class, NOT here — verify reads those in a pyyaml-less env. See docker/CONTRACT.md
+# and PRESAGE_NOTES.md.
+
+model_key: presage                                   # config `model` field
+sif_path: docker/presage/presage.sif                 # repo-relative; resolved via the customapps symlink
+entry: [python, /app_code/presage/run_model.py]      # argv run via `singularity exec`
+code_binds:                                          # host dir -> in-container mount (env-only sif)
+  docker/presage: /app_code/presage                  # wrapper inlines its data-load shim; no harness bind
+extra_config:                                        # model-specific keys injected verbatim into config.json
+  presage_cache_path: /opt/presage_cache             # baked Zenodo pathway-embedding cache (see presage.def)
+wandb_project: vcr-presage-ct                        # self-hosted W&B (train only; endpoint via WANDB_* env)
+
+# Hard ceilings, in seconds. Note train_timeout doubles as the abandoned-claim TTL
+# (TrainedPredictor._claim_ttl), so it is sized to the job, not padded: atheus ran
+# PRESAGE at 24 h walltime (36 h only for jiang24).
+train_timeout: 86400                                 # 24 h
+predict_timeout: 7200                                # 2 h
+
+# Artefacts that must ALL exist for a run dir to count as trained (relative to it).
+# `cache/` is durable state, not scratch: predict RESTORES the pathway embeddings
+# from here (presage_wrapper._load_trained_model) and cannot rebuild them, so
+# deleting it leaves a checkpoint that can never predict again. Likewise
+# presage_data/ — predict rebuilds the datamodule from the exact processed h5ad and
+# splits.json that training used.
+expected_artifacts:
+  - trained_model.ckpt                               # BEST-VAL weights (see V5 in presage_wrapper.py)
+  - model_config.json                                # resolved PRESAGE model config
+  - presage_training_hparams.json                    # artefact map + covariate pinning + report
+  - control_mean.csv                                 # per-covariate control mean (delta -> absolute)
+  - pathway_files_absolute.txt                       # prior-knowledge manifest, cwd-relative cache paths
+  - cache/pathway_embeddings                         # derived embeddings; predict cannot rebuild them
+  - presage_data/cellsimbench_processed.h5ad         # the converted adata training actually saw
+  - presage_data/splits.json                         # the condition lists training actually used
+
+# Hyperparameters — pinned to the **authors' own sweep** for single-perturbation
+# datasets (`train_presage.py:366-500`, under `if data.dataset in single_datasets`),
+# which is our regime. Audited value-by-value 2026-08-26; full table and the
+# reasoning in PRESAGE_NOTES.md §3.
+#
+# Upstream publishes NO config file: both `train.py`'s argparse default
+# (./config/gears_adata.yml) and the authors' run_presage.sh (./configs/*.json)
+# point at directories absent from the repo. The two recoverable author reference
+# points are the argparse defaults and this sweep, and they DISAGREE on four
+# values — where they do, the sweep wins, because it is what the authors actually
+# tuned for this kind of dataset. Deviations are marked inline.
+# Do not tune toward a target.
+hyperparameters:
+  # --- architecture ---
+  item_hidden_size: 512
+  item_nlayers: 0               # 0 => a single linear layer
+  pathway_item_hidden_size: 128
+  pathway_item_nlayers: 2
+  num_heads: 4                  # was hardcoded (twice: ComboPRESAGE also overwrote it)
+  batch_norm: true              # was hardcoded
+  # --- pooling ---
+  pathway_pool_type: sum
+  pathway_weight_type: gat
+  pool_nlayers: 2
+  softmax_temperature: 0.1        # authors' sweep (argparse default is 0.15)
+  gat_weight: 0.85
+  # --- prior-knowledge embeddings ---
+  n_nmf_embedding: 128
+  pathway_embedding_dimension: 5    # was hardcoded
+  n_neigh_prune: '5'                # was hardcoded (string on purpose — PRESAGE parses it)
+  node2vec_walk_length: 100
+  node2vec_context_size: 5
+  node2vec_walks_per_node: 3
+  node2vec_num_negative_samples: 3
+  node2vec_p: 1.0
+  node2vec_q: 2.0
+  node2vec_batchsize: 32           # upstream default AND the authors' sweep value; independent of batch_size (V16)
+  # --- optimisation ---
+  optimizer: Adam               # was hardcoded
+  lr: 0.000866                    # OUR choice, flagged as such: the authors SWEPT lr
+                                  # log-uniform over 5e-4..1.5e-3 rather than fixing it, and
+                                  # did not publish the winner. 8.66e-4 is the geometric mean
+                                  # of that range — the midpoint under their own log-uniform
+                                  # prior. The argparse default (2.4e-3) is 1.6x ABOVE their
+                                  # upper bound, so it cannot be what they tuned to.
+  weight_decay: 1.0e-15           # authors' sweep (argparse default is 2.17e-13)
+  momentum: 0.9                 # was hardcoded (unused by Adam; kept — ModelHarness reads it)
+  batch_size: 256                 # authors' sweep. NOT the argparse default (16), and NOT
+                                  # atheus's 32, which matched no author source at all.
+  max_epochs: 1000              # a ceiling, not a target: early stopping decides
+  early_stopping_patience: 10   # was an implicit .get() default; pinned explicitly
+  early_stopping_min_delta: 0.0 # was an implicit .get() default; pinned explicitly
+  # --- loss ---
+  # Only MSE is live: ComboPRESAGE.compute_loss is `((pred - expr) ** 2).mean()`.
+  # The scales below are carried because upstream's config schema requires them;
+  # they are inert, and the atheus config says so too. Kept at 1.0 rather than
+  # deleted so the config PRESAGE receives matches what upstream expects.
+  mse_loss_scale: 1.0
+  cosine_loss_scale: 1.0
+  vector_norm_loss_scale: 1.0

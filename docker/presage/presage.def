@@ -1,0 +1,180 @@
+# PRESAGE training/inference container — pinned Singularity definition (ENV ONLY).
+#
+# Design (identical to docker/gears/gears.def): this image holds ONLY the frozen
+# environment — the upstream PRESAGE checkout, its conda env, and the pathway-
+# embedding cache. Our thin code (run_model.py, presage_wrapper.py,
+# presage_datamodule_csb.py) is NOT baked in; it is BIND-MOUNTED from the host
+# repo at run time by benchmark/predictors/_container/runner.py under
+# /app_code/presage. Editing the wrapper needs no rebuild.
+#
+# LICENSING: PRESAGE is Genentech Non-Commercial Software License v1.0. The
+# licence is copied into the image at /LICENSE from the clone; LICENSE, NOTICE and
+# MODIFICATIONS.md also sit beside this file in the repo and are bind-mounted with
+# the code they describe. The image must NOT be pushed to a public registry.
+#
+# PINS:
+#   base     condaforge/mambaforge  — supplies mamba + glibc only. See the DIGEST
+#            note below: this is the one input not yet digest-pinned.
+#   PRESAGE  github.com/Genentech/PRESAGE @ 2c7b231c60cf110c4aab0acf8ecd2c2b3268fffb
+#   env      the upstream repo's own environment.yml — a full conda lock with build
+#            strings (python 3.11.12, pytorch 2.2.0+cu121, pyg 2.5.2, lightning
+#            2.5.1, numpy 1.26.4). A copy is vendored beside this def as the record.
+#   cache    Zenodo record 15587986 (pathway embeddings) -> /opt/presage_cache
+#
+# DIGEST TODO (do this on the build host, which has network):
+#   singularity exec docker://condaforge/mambaforge:latest true   # populates cache
+#   # or: skopeo inspect docker://condaforge/mambaforge:latest | grep Digest
+# then replace the `From:` line with `condaforge/mambaforge@sha256:<digest>` and
+# record it in PRESAGE_NOTES.md. Until then the env pins above carry
+# reproducibility and the base carries only mamba.
+#
+# BUILD on the ETH CustomApps client (has --fakeroot + internet; see
+# docker/gears/BUILD_ENV.md — same route, same reasons). This def needs NO local
+# files, so it can simply be pasted there:
+#   mkdir -p /cluster/customapps/biomed/boeva/akalygina/singularity/presage
+#   cd       /cluster/customapps/biomed/boeva/akalygina/singularity/presage
+#   export SINGULARITY_CACHEDIR=$PWD/.cache SINGULARITY_TMPDIR=$PWD/.tmp
+#   chmod o+x . && singularity build --fakeroot presage.sif presage.def && chmod o-x .
+# NOTE the TMPDIR override: the atheus Docker equivalent of this image is 19.2 GB
+# (their largest), against GEARS' 3.4 GB, and a build needs 2-3x that in scratch —
+# more than the client's /tmp. The sif then appears read-only on LeoMed at the same
+# /cluster/customapps path; symlink it to docker/presage/presage.sif.
+
+Bootstrap: docker
+From: condaforge/mambaforge:latest
+
+%post
+    set -eu
+    apt-get update && apt-get install -y --no-install-recommends git wget ca-certificates \
+        && rm -rf /var/lib/apt/lists/*
+
+    # --- upstream PRESAGE, pinned by commit SHA ---
+    git clone https://github.com/Genentech/PRESAGE.git /presage_repo
+    cd /presage_repo
+    git checkout 2c7b231c60cf110c4aab0acf8ecd2c2b3268fffb
+    # The wrapper imports `presage`, `presage_datamodule`, `model_harness`, `train`
+    # from here, and reads sample_files/prior_files/ for the knowledge manifest.
+    cp -r /presage_repo/src /presage_src
+    cp -r /presage_repo/sample_files /presage_src/sample_files
+    test -f /presage_src/presage.py
+    test -f /presage_src/sample_files/prior_files/sample.knowledge_experimental.txt
+
+    # --- conda env, from the upstream lock ---
+    mamba env create -f /presage_repo/environment.yml
+    # Guards on top of the upstream lock, not upgrades. `numpy<2` because parts of
+    # the PRESAGE/PyG stack are numpy-1 only; `wandb` for the same reason gears.def
+    # adds it (training logs go to the self-hosted W&B). Both are already satisfied
+    # by the lock today — they are here so a future upstream env change is caught
+    # at build time rather than at training time.
+    #
+    # NOT bumped: anndata. The atheus Dockerfile forced `anndata>=0.12.0`; we
+    # deliberately keep the lock's 0.11.4, because that is exactly what the host
+    # `vcell` env runs. The container WRITES the h5ads the host reads back
+    # (predictions.h5ad, cellsimbench_processed.h5ad), so matching versions is the
+    # correct choice, not merely the safer one — a newer writer can emit an
+    # encoding the host cannot read.
+    mamba run -n presage pip install --no-cache-dir "numpy<2" wandb
+    mamba clean -afy
+
+    # --- pathway-embedding cache (static upstream asset, Zenodo record 15587986) ---
+    # Baked rather than bind-mounted (unlike GEARS' 9.5 MB gene2go pickle): it is
+    # far too large to carry in git, and /cluster/work is full. The wrapper copies
+    # it into each run dir at train time, so this stays read-only.
+    cd /
+    wget -q -O cache.tar.gz "https://zenodo.org/records/15587986/files/cache.tar.gz?download=1"
+    mkdir -p /opt/_cache_extract
+    tar --no-same-owner -xzf cache.tar.gz -C /opt/_cache_extract
+    rm cache.tar.gz
+    # The tarball's top level is `cache/`; normalise to a name that says what it is.
+    if [ -d /opt/_cache_extract/cache ]; then
+        mv /opt/_cache_extract/cache /opt/presage_cache
+        rmdir /opt/_cache_extract
+    else
+        mv /opt/_cache_extract /opt/presage_cache
+    fi
+    # Fail the BUILD, not the first training run, if the layout changed upstream.
+    test -d /opt/presage_cache/pathway_embeddings
+
+    # The Zenodo tarball carries mode 0750 on its directories, and
+    # `tar --no-same-owner` keeps the mode while remapping ownership to the build
+    # user (root, under fakeroot). At run time we are NOT root, so the cache would
+    # be unreadable and _seed_cache's copytree would fail on the first training
+    # run. Build-time %test does not catch this — it runs as root.
+    chmod -R a+rX /opt/presage_cache
+    test -z "$(find /opt/presage_cache \( -type d ! -perm -o+rx \) -o \( -type f ! -perm -o+r \) -print -quit)"
+    du -sh /opt/presage_cache
+
+    # --- licence, carried inside the image ---
+    # From the clone, not from the build context: a %files section would mean this
+    # def could no longer be pasted onto the build host on its own. Our own
+    # MODIFICATIONS.md is not upstream's to ship — it travels with the wrapper it
+    # describes, bind-mounted at /app_code/presage, so the disclosure is present
+    # wherever the modified code is.
+    # Upstream ships it as LICENSE.txt, not LICENSE (our NOTICE records the same:
+    # "the upstream license is provided at .../ref/PRESAGE/LICENSE.txt"). Globbed
+    # rather than hardcoded so a rename upstream degrades to a warning instead of
+    # failing the build — the licence also travels with the bind-mounted code at
+    # /app_code/presage/LICENSE, which is where the modified code actually lives.
+    UPSTREAM_LIC=$(ls /presage_repo/LICENSE* /presage_repo/COPYING* 2>/dev/null | head -1 || true)
+    if [ -n "${UPSTREAM_LIC:-}" ]; then
+        cp "$UPSTREAM_LIC" /LICENSE
+        echo "licence copied from $UPSTREAM_LIC"
+    else
+        echo "WARNING: no LICENSE* at the upstream repo root; the Genentech licence" \
+             "travels with the bind-mounted code at /app_code/presage/LICENSE"
+    fi
+
+    # --- lockfile for reproducible rebuilds ---
+    mamba run -n presage pip freeze > /opt/presage_lockfile.txt
+    mamba env export -n presage > /opt/presage_conda_lock.yml
+    echo "lockfiles written to /opt/presage_lockfile.txt and /opt/presage_conda_lock.yml"
+
+%environment
+    # Put the env's interpreter first so `python` IS the presage python. This is
+    # what lets model.yaml use the same `entry: [python, .../run_model.py]` as
+    # GEARS instead of the atheus `mamba run -n presage ...` entrypoint — one
+    # contract, no per-model special case. It also sidesteps the host-conda
+    # leakage the atheus runner had to scrub env vars and pass --no-home to avoid:
+    # there is no `mamba run` left to confuse.
+    export PATH=/opt/conda/envs/presage/bin:$PATH
+    export PRESAGE_SRC=/presage_src
+    export PYTHONUNBUFFERED=1
+    # scanpy imports numba functions declared with @njit(cache=True); numba writes
+    # that cache next to the source, which is read-only inside the image. It
+    # happens to survive because singularity bind-mounts a writable $HOME, but
+    # that is luck, not design (it breaks under --no-home, and it dirties the
+    # user's home quota on every run). Point both caches somewhere writable and
+    # disposable instead. `:-` so a caller can still override.
+    export NUMBA_CACHE_DIR=${NUMBA_CACHE_DIR:-/tmp/numba_cache}
+    export MPLCONFIGDIR=${MPLCONFIGDIR:-/tmp/mpl_cache}
+
+%runscript
+    # Generic entry: run whatever host-mounted script the runner passes as argv.
+    exec python "$@"
+
+%test
+    python -c "import sys, torch, anndata, scanpy, pytorch_lightning; \
+        assert sys.executable.startswith('/opt/conda/envs/presage/'), sys.executable; \
+        print('python', sys.version.split()[0], '| torch', torch.__version__, \
+              '| anndata', anndata.__version__, '| scanpy', scanpy.__version__)"
+    PYTHONPATH=/presage_src python -c "import presage, model_harness, presage_datamodule, train; print('presage src OK')"
+    test -d /opt/presage_cache/pathway_embeddings && echo 'cache OK'
+
+%labels
+    org.vcr.model presage
+    org.vcr.presage_commit 2c7b231c60cf110c4aab0acf8ecd2c2b3268fffb
+    org.vcr.cache_source zenodo.org/records/15587986
+    org.vcr.license LicenseRef-Genentech-NonCommercial-1.0
+    org.vcr.contract combined-form; code bind-mounted at /app_code/presage
+
+%help
+    PRESAGE perturbation-prediction container — ENVIRONMENT ONLY.
+    Our code is bind-mounted from the host at run time by
+    benchmark/predictors/_container/runner.py, e.g.:
+        singularity exec --nv \
+          --bind <repo>/docker/presage:/app_code/presage:ro \
+          --bind <data>:/data:ro --bind <cfg>:/config.json:ro --bind <out>:/model_output \
+          --env PYTHONPATH=/app_code/presage \
+          presage.sif python /app_code/presage/run_model.py {train|predict} /config.json
+    Config schema: docker/CONTRACT.md. Recipe: docker/presage/model.yaml.
+    No cellsimbench dependency. Genentech Non-Commercial licence — do not publish.
