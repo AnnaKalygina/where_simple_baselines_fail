@@ -283,6 +283,19 @@ class ContainerPredictor(TrainedPredictor):
         Required, not defaulted: an empty list would make ``missing_artifacts``
         return nothing, so an EMPTY run dir would report itself trained and
         ``fit``'s post-condition would pass after a crash.
+
+        WHY THERE IS NO POST-PREDICT CACHE PRUNE (considered, rejected). The
+        obvious way to reclaim the ~5 GB a GEARS run leaves behind is to drop
+        the "regenerable" half of this list once a fold is scored. Both shipped
+        recipes say there is no such half: GEARS lists
+        ``processed_data/.../cell_graphs.pkl`` because predict RE-PREPARES its
+        split from it, and PRESAGE lists ``cache/pathway_embeddings`` with
+        "predict cannot rebuild them". Since ``is_trained`` validates exactly
+        this list, pruning any of it turns a valid checkpoint into an untrained
+        one and the next predict costs a full retrain. The rule "never prune an
+        artifact ``is_trained`` depends on" therefore resolves to "prune
+        nothing". The storage problem is real and stays open; this is not its
+        instrument.
         """
         artifacts = self._recipe()["expected_artifacts"]
         if not artifacts:

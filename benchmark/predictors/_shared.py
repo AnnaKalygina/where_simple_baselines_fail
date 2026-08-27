@@ -8,7 +8,8 @@ module) so a single fix propagates and the dependency arrows stay clean:
 
 Everything here is predictor-agnostic: split-index resolution, output-shape
 computation, masked reductions over a (n_bins, n_kos) grid, combo-pair
-resolution, and target-gene resolution. None of it imports ``base.Predictor``,
+resolution, target-gene resolution, and the run-identity fingerprint that both
+persisting tiers write and compare. None of it imports ``base.Predictor``,
 so a module can pull in a shape helper without dragging in a concrete predictor
 set. ``DatasetStore`` / ``SplitInfo`` are referenced for typing only (the bodies
 duck-type ``store``), so this module has no runtime dependency on
@@ -16,8 +17,13 @@ duck-type ``store``), so this module has no runtime dependency on
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
-from typing import TYPE_CHECKING, Dict, List, Tuple
+import os
+import subprocess
+from pathlib import Path
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -154,3 +160,113 @@ def resolve_target_gene_indices(
             f"force-included into the panel."
         )
     return [gene_to_idx[p] for p in parts if p in gene_to_idx]
+
+
+# ===================================================================
+# Run identity — the fingerprint both persisting tiers share
+# ===================================================================
+# `LearnedPredictor` and `TrainedPredictor` persist very different things (a
+# small `weights.npz` of coefficients; a multi-GB checkpoint dir), but they ask
+# the SAME question of it: is this still valid for the store, scenario and fold
+# I am being asked about? One answer, written and compared the same way, so the
+# cheap tier cannot quietly hold itself to a lower standard than the expensive
+# one. What each tier ENFORCES differs and is declared by that tier — the
+# expensive one also has a seed and a recipe; the cheap one has neither.
+
+
+#: Written next to whatever a tier persists, read back before that state is
+#: reused. Host-written on purpose: it must not depend on what a particular
+#: container chooses to emit.
+FINGERPRINT_FILE = "fingerprint.json"
+
+#: How a mismatched field reads in the message a user actually sees.
+STALE_REASON = {
+    "seed": "seed",
+    "gene_axis_sha": "the gene panel",
+    "split_sha": "the train/test split",
+    "recipe_sha": "the training recipe",
+}
+
+
+def sha_strings(items) -> str:
+    h = hashlib.sha256()
+    for s in items:
+        h.update(str(s).encode())
+        h.update(b"\0")
+    return h.hexdigest()[:16]
+
+
+def sha_json(obj) -> str:
+    return hashlib.sha256(
+        json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def sha_split(store: "DatasetStore", scenario: str, fold: int) -> str:
+    """Hash of WHICH cells are trainable and which are held out.
+
+    Hashes the two canonical masks rather than the index marginals, so every
+    regime is covered by one expression — including UnseenPair, whose held-out
+    unit is a scattered set of (bin, ko) pairs that no marginal describes.
+    """
+    split = store.split(scenario, fold)
+    h = hashlib.sha256()
+    for mask in (split.train_mask_2d(store.n_bins, store.n_kos),
+                 split.test_mask_2d(store.n_bins, store.n_kos)):
+        h.update(np.ascontiguousarray(mask, dtype=bool).tobytes())
+        h.update(b"|")
+    return h.hexdigest()[:16]
+
+
+def git_head() -> Optional[str]:
+    """Short git SHA of the working tree, or None outside a repo. Advisory."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or None
+    except Exception:                                  # noqa: BLE001 - provenance only
+        return None
+
+
+def write_fingerprint(path: Path, fp: Dict, extra: Optional[Dict] = None) -> None:
+    """Stamp provenance onto `fp` and write it atomically.
+
+    Atomic because a torn write is otherwise only caught by JSON failing to
+    parse, which is incidental safety rather than a guarantee — the same
+    standard the CSV writer in `run_pipeline` and the container's V11 assertion
+    are held to. Temp file in the same directory, so `os.replace` is a rename
+    within one filesystem and never a copy.
+
+    `code_sha` is stamped HERE rather than computed in the fingerprint itself:
+    it is advisory provenance that no tier enforces, so paying for a `git`
+    subprocess once per persisted run is right, and paying for it on every
+    `is_trained` comparison is not.
+    """
+    fp = dict(fp)
+    fp["code_sha"] = git_head()
+    if extra:
+        fp["report"] = extra
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(fp, indent=2))
+    os.replace(tmp, path)
+
+
+def staleness_reason(path: Path, current: Dict, enforced) -> Optional[str]:
+    """Why the state beside `path` is not reusable for `current`, or None.
+
+    Presence is not validity: artefacts that all exist can still have been
+    produced against a different panel, split or recipe.
+    """
+    if not path.exists():
+        return f"missing {FINGERPRINT_FILE} (trained before fingerprinting?)"
+    try:
+        stored = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        return f"unreadable {FINGERPRINT_FILE} ({e})"
+
+    for key in enforced:
+        if stored.get(key) != current[key]:
+            return (f"{STALE_REASON.get(key, key)} changed since training "
+                    f"({stored.get(key)!r} != {current[key]!r}); "
+                    f"retrain with --force")
+    return None

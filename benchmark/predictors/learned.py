@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -32,9 +32,14 @@ from benchmark.config import parse_target_genes, weights_path
 from benchmark.data_loader import DatasetStore, SplitInfo
 from benchmark.predictors.base import Predictor, register
 from benchmark.predictors._shared import (
+    FINGERPRINT_FILE,
     _expected_output_shape,
     masked_mean,
     resolve_combo_pairs,
+    sha_split,
+    sha_strings,
+    staleness_reason,
+    write_fingerprint,
 )
 
 log = logging.getLogger(__name__)
@@ -125,34 +130,83 @@ class LearnedPredictor(Predictor):
     explicit second step that only `run_pipeline fit` takes.
     """
 
-    needs_training = True
+    #: Fields whose disagreement makes persisted weights unusable. The expensive
+    #: tier also enforces `seed` and `recipe_sha`; this one has neither, and
+    #: declaring fields that cannot differ would be a lie dressed as a check:
+    #: these fits are closed-form, and no learned predictor is constructed with
+    #: non-default arguments anywhere in the repo, so its hyperparameters change
+    #: only by editing source — which the advisory `code_sha` already records.
+    _ENFORCED = ("gene_axis_sha", "split_sha")
 
     @classmethod
     def _weights_file(cls, dataset: str, scenario: str, fold: int) -> Path:
         return weights_path(dataset, cls.name, scenario, fold)
 
+    @classmethod
+    def _fingerprint_file(cls, dataset: str, scenario: str, fold: int) -> Path:
+        return cls._weights_file(dataset, scenario, fold).parent / FINGERPRINT_FILE
+
+    def _fingerprint(self, store, scenario: str, fold: int) -> Dict:
+        """What must still hold for these coefficients to mean anything."""
+        return {
+            "predictor": self.name,
+            "dataset": store.dataset,
+            "scenario": scenario,
+            "fold": int(fold),
+            "gene_axis_sha": sha_strings(store.gene_names),
+            "split_sha": sha_split(store, scenario, fold),
+        }
+
     def is_trained(self, store, scenario: str, fold: int) -> bool:
-        """Present AND readable AND non-empty.
+        """Present AND readable AND non-empty AND still valid for this fold.
 
         A bare `.exists()` is what made the old CLI gate lie: a killed `fit`
         leaves a truncated npz that exists but cannot be loaded, and the base
         class used to write a deliberately EMPTY npz for every predictor. Open
         it and require at least one array, so those both read as "not trained".
-        (Not yet checked: whether the weights match the current code/params —
-        that needs a fingerprint stored inside the npz.)"""
+        (Nothing writes an empty one any more: `persist` below is the only
+        writer, and the tiers that have no state have no `persist` at all.)
+
+        Then the same question the expensive tier asks: do these weights still
+        match the panel and the split they were fitted on? `W` is
+        (n_features, n_genes) and the fit used the TRAIN cells, so a rebuilt
+        panel or a regenerated fold silently turns valid coefficients into
+        coefficients fitted on cells that are now test. Cheap to refit is not a
+        reason to check less.
+        """
         path = self._weights_file(store.dataset, scenario, fold)
         if not path.exists():
             return False
         try:
             with np.load(str(path), allow_pickle=True) as z:
-                return len(z.files) > 0
+                if not z.files:
+                    return False
         except Exception:
             return False
 
+        reason = staleness_reason(
+            self._fingerprint_file(store.dataset, scenario, fold),
+            self._fingerprint(store, scenario, fold), self._ENFORCED)
+        if reason:
+            log.info("%s %s/%s/fold%d: weights unusable — %s",
+                     self.name, store.dataset, scenario, fold, reason)
+            return False
+        return True
+
     def persist(self, store, scenario: str, fold: int) -> Path:
-        """Write this fold's trained coefficients; returns the path written."""
+        """Write this fold's coefficients and the fingerprint they are valid
+        under; returns the weights path.
+
+        The directory is created HERE rather than in each subclass's
+        `save_weights` — six of the seven remembered to, which is the usual
+        argument for the tier owning it. Fingerprint last: weights without a
+        fingerprint read as untrained, which is the safe way round.
+        """
         path = self._weights_file(store.dataset, scenario, fold)
+        path.parent.mkdir(parents=True, exist_ok=True)
         self.save_weights(path)
+        write_fingerprint(self._fingerprint_file(store.dataset, scenario, fold),
+                          self._fingerprint(store, scenario, fold))
         return path
 
     @classmethod
@@ -702,7 +756,7 @@ class MeanPlusTargetScaling(LearnedPredictor):
         return get_predictor(name)()
 
     def fit(self, store, scenario, fold):
-        # The mean components are stateless (needs_training=False); only alpha is fit.
+        # The mean components are stateless analytical predictors; only alpha is fit.
         self._ts.fit(store, scenario, fold)
 
     def predict(self, store, scenario, fold):

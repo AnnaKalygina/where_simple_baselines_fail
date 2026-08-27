@@ -45,7 +45,8 @@ from benchmark.meta_metrics import (
     summarize_metric_distributions,
 )
 from benchmark.predictors.base import (
-    PREDICTOR_REGISTRY, _ensure_predictors_loaded, predictor_category)
+    PREDICTOR_REGISTRY, _ensure_predictors_loaded, needs_training,
+    predictor_category)
 from benchmark.predictors.learned import LearnedPredictor
 from benchmark.predictors.trained import TrainedPredictor
 
@@ -233,6 +234,14 @@ def cmd_roster(args) -> None:
 
     Everything here is read off the classes, so it cannot drift from the code
     the way the old hand-kept category table did. `--json` for tooling.
+
+    WHY THERE IS NO COMMITTED `ROSTER.json` (considered, rejected). Writing this
+    output to a tracked file and having `verify` regenerate-and-diff it was
+    proposed as the way to give non-Python consumers a stable list. But a
+    committed copy of a live derivation is precisely the thing that drifts — the
+    differ would exist only to police the copy — and every consumer that wanted
+    it already imports `benchmark`, so it can read `PREDICTOR_REGISTRY` or shell
+    out to `roster --json` and need neither the file nor the differ.
     """
     _ensure_predictors_loaded()
     rows = []
@@ -242,7 +251,7 @@ def cmd_roster(args) -> None:
             "name": name,
             "category": predictor_category(cls),
             "module": cls.__module__.rsplit(".", 1)[-1],
-            "needs_training": bool(cls.needs_training),
+            "needs_training": needs_training(cls),
             "has_drop_rule": bool(cls.has_drop_rule),
             "scenarios": list(cls.scenarios),
             **({"cell_aware": bool(cls.cell_aware)}
@@ -321,7 +330,7 @@ def cmd_fit(args) -> None:
                 log.info("skip %s/%s/fold%d %s (not in scenarios)", ds, sc, fold, p)
                 continue
             model = cls()
-            if (cls.needs_training and not getattr(args, "force", False)
+            if (needs_training(cls) and not getattr(args, "force", False)
                     and model.is_trained(store, sc, fold)):
                 log.info("FIT %s/%s/fold%d %s: trained state already present — "
                          "skipping (--force to redo)", ds, sc, fold, p)
@@ -363,7 +372,7 @@ def cmd_predict(args) -> None:
             # fold is skipped with a clear message; previously a stale/empty
             # weights.npz made this branch either retrain silently or crash.
             model = cls()
-            if cls.needs_training and not model.is_trained(store, sc, fold):
+            if needs_training(cls) and not model.is_trained(store, sc, fold):
                 log.warning("PREDICT %s/%s/fold%d %s: not trained — run `fit` "
                             "(or `all`) first; skipping", ds, sc, fold, p)
                 continue

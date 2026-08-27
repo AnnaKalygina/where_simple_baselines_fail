@@ -6,7 +6,7 @@ used by BS/CF as the `positive_predictor` reference.
 
   * Tech-duplicate   — predicts second_half pseudobulk delta for each test KO.
                         Read off `store.second_half_deltas` directly.
-                        Read-only (no `fit`); inherits `needs_training = False`.
+                        Read-only (no `fit`), so it carries no trained state.
   * Interp-duplicate — predicts the second-half DEG vector reindexed to var_names,
                         scaled by the predicted KO's first-half delta sign.
                         Useful as a "weak positive control" — captures DEG-level

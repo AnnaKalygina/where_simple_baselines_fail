@@ -57,13 +57,13 @@ class Predictor(ABC):
     Subclasses MUST set the class attributes `name` and `scenarios` (the list of
     PascalCase scenario names this predictor can handle).
 
-    `needs_training` is NOT among them: it is a property of the TIER, declared
-    once on each tier base (False here, True on `LearnedPredictor` and
-    `TrainedPredictor`) and inherited. It used to be restated on all 22 concrete
-    predictors, which is 19 chances to state it wrong. It stays declared rather
-    than derived because there is no honest derivation — a no-op `fit` means True
-    for a model trained elsewhere and False for an analytical baseline, so any
-    predicate over `fit` misclassifies one of them.
+    `needs_training` is NOT among them, and is no longer an attribute at all: it
+    is DERIVED from the tier by the module-level `needs_training(cls)` below. It
+    was restated on all 22 concrete predictors, then collapsed to three tier
+    declarations, then to none. The derivation was dishonest only while
+    `DLAdapter` existed — a plain `Predictor` whose `fit` was a no-op because it
+    had trained elsewhere, so no predicate over the hierarchy could place it.
+    With that tier deleted, "trains" and "is in a training tier" coincide.
 
     Instances are typically constructed via the registry:
 
@@ -79,7 +79,6 @@ class Predictor(ABC):
     """
 
     name: str = ""
-    needs_training: bool = False
     scenarios: List[str] = []
     # True for predictors with a per-target drop rule (cover < all perts is OK).
     # The verifier derives its coverage invariant from this attribute.
@@ -125,7 +124,7 @@ class Predictor(ABC):
         multi-GB container run dir, nothing at all), so each tier owns it
         rather than every predictor stubbing out a method it cannot honour.
         """
-        return not self.needs_training
+        return not needs_training(type(self))
 
     def save_predictions(
         self,
@@ -292,6 +291,26 @@ def predictor_category(cls) -> str:
     if issubclass(cls, LearnedPredictor):
         return "learned"
     return cls.__module__.rsplit(".", 1)[-1]
+
+
+def needs_training(cls) -> bool:
+    """Does `predict` require a prior `fit`? DERIVED — never declared.
+
+    Answered by tier membership, because after the adopted-DL tier was deleted
+    those are the same question: a `LearnedPredictor` persists coefficients, a
+    `TrainedPredictor` persists a checkpoint, and everything else carries no
+    trained state at all. `DLAdapter` was the one class that broke the
+    equivalence — a plain `Predictor` with a no-op `fit`, because its training
+    had happened in another repo — and it is gone.
+
+    Kept a module-level function rather than a class attribute so it cannot be
+    restated (and mis-stated) per predictor; the same reasoning, and the same
+    call-time imports, as `predictor_category` above.
+    """
+    from benchmark.predictors.learned import LearnedPredictor
+    from benchmark.predictors.trained import TrainedPredictor
+
+    return issubclass(cls, (LearnedPredictor, TrainedPredictor))
 
 
 # ===================================================================

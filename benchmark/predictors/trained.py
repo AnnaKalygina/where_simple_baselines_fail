@@ -27,12 +27,10 @@ post-conditions, so a new expensively-trained model cannot forget them.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
 import socket
-import subprocess
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -41,14 +39,12 @@ import numpy as np
 
 from benchmark.config import checkpoint_dir
 from benchmark.data_loader import DatasetStore
-from benchmark.predictors._shared import _expected_output_shape
+from benchmark.predictors._shared import (
+    FINGERPRINT_FILE, _expected_output_shape, sha_json, sha_split, sha_strings,
+    staleness_reason, write_fingerprint)
 from benchmark.predictors.base import Predictor
 
 log = logging.getLogger(__name__)
-
-#: Written by `fit`, read by `is_trained`. Host-written on purpose: it must not
-#: depend on what a particular container chooses to emit.
-FINGERPRINT_FILE = "fingerprint.json"
 
 #: Written while a run is in flight, removed when it finishes. Makes a crashed
 #: run distinguishable from a running one — the two look identical on disk.
@@ -57,8 +53,6 @@ CLAIM_FILE = "RUNNING.json"
 
 class TrainedPredictor(Predictor):
     """Base for predictors whose training is expensive and produces a checkpoint."""
-
-    needs_training = True
 
     #: Seed for training. Folds may map to different seeds via `_seed_for`.
     seed: int = 42
@@ -151,9 +145,9 @@ class TrainedPredictor(Predictor):
             "scenario": scenario,
             "fold": int(fold),
             "seed": int(self._seed_for(fold)),
-            "gene_axis_sha": _sha_strings(store.gene_names),
-            "split_sha": _sha_split(store, scenario, fold),
-            "recipe_sha": _sha_json(self._recipe_fingerprint()),
+            "gene_axis_sha": sha_strings(store.gene_names),
+            "split_sha": sha_split(store, scenario, fold),
+            "recipe_sha": sha_json(self._recipe_fingerprint()),
         }
 
     #: Fields whose disagreement makes a checkpoint unusable. `code_sha` is
@@ -162,11 +156,8 @@ class TrainedPredictor(Predictor):
 
     def _write_fingerprint(self, store: DatasetStore, scenario: str, fold: int,
                            run_dir: Path, extra: Optional[Dict] = None) -> None:
-        fp = self._fingerprint(store, scenario, fold)
-        fp["code_sha"] = _git_head()          # provenance, stamped once per run
-        if extra:
-            fp["report"] = extra
-        (run_dir / FINGERPRINT_FILE).write_text(json.dumps(fp, indent=2))
+        write_fingerprint(run_dir / FINGERPRINT_FILE,
+                          self._fingerprint(store, scenario, fold), extra)
 
     def _staleness_reason(self, store: DatasetStore, scenario: str,
                           fold: int) -> Optional[str]:
@@ -175,21 +166,10 @@ class TrainedPredictor(Predictor):
         Presence is not validity: a checkpoint whose artefacts all exist can
         still have been trained against a different panel, split or recipe.
         """
-        path = self._run_dir(store, scenario, fold) / FINGERPRINT_FILE
-        if not path.exists():
-            return f"missing {FINGERPRINT_FILE} (trained before fingerprinting?)"
-        try:
-            stored = json.loads(path.read_text())
-        except (OSError, ValueError) as e:
-            return f"unreadable {FINGERPRINT_FILE} ({e})"
-
-        current = self._fingerprint(store, scenario, fold)
-        for key in self._ENFORCED:
-            if stored.get(key) != current[key]:
-                return (f"{_STALE_REASON.get(key, key)} changed since training "
-                        f"({stored.get(key)!r} != {current[key]!r}); "
-                        f"retrain with --force")
-        return None
+        return staleness_reason(
+            self._run_dir(store, scenario, fold) / FINGERPRINT_FILE,
+            self._fingerprint(store, scenario, fold),
+            self._ENFORCED)
 
     def _clean_run_dir(self, run_dir: Path) -> None:
         """Remove whatever a previous run left that this one must not inherit.
@@ -391,6 +371,19 @@ class TrainedPredictor(Predictor):
 
         deltas = self._infer(store, scenario, fold, run_dir)
 
+        # `_infer` returns a bare array, not `(deltas, gene_names, ko_names,
+        # bin_names)` for this template to align (considered, rejected). Both
+        # tiers already derive their axes FROM the store — the container maps
+        # its `predictions.h5ad` onto `store.gene_names` + the split indices
+        # inside `tensor_map`, the torch tier builds its pairs from
+        # `test_bin_indices`/`test_ko_indices` — so returning those names would
+        # hand the store's own labels back to be compared against the store's
+        # own labels. Having `_infer` return the MODEL's pre-alignment names
+        # instead would mean moving `tensor_map`'s combo normalisation, gene
+        # intersection and covariate case-folding up here, generically, for two
+        # tiers with different inputs: the rewrite the reuse commitment in
+        # TRAINING_INFRA_PLAN.md forbids by name. What the template CAN add is
+        # the check below, which catches a future reordering.
         split = store.split(scenario, fold)
         expected = _expected_output_shape(
             store, split.test_bin_indices_or_all(store.n_bins),
@@ -411,15 +404,10 @@ class TrainedPredictor(Predictor):
 
 
 # ---------------------------------------------------------------------------
-# Fingerprint helpers
+# Claim helpers
 # ---------------------------------------------------------------------------
-
-_STALE_REASON = {
-    "seed": "seed",
-    "gene_axis_sha": "the gene panel",
-    "split_sha": "the train/test split",
-    "recipe_sha": "the training recipe",
-}
+# The fingerprint itself lives in `_shared`: the learned tier asks the same
+# question of its `weights.npz` and must get the same answer.
 
 
 def _read_claim(path: Path) -> Optional[Dict]:
@@ -430,41 +418,3 @@ def _read_claim(path: Path) -> Optional[Dict]:
         return None
 
 
-def _sha_strings(items) -> str:
-    h = hashlib.sha256()
-    for s in items:
-        h.update(str(s).encode())
-        h.update(b"\0")
-    return h.hexdigest()[:16]
-
-
-def _sha_json(obj) -> str:
-    return hashlib.sha256(
-        json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
-
-
-def _sha_split(store: DatasetStore, scenario: str, fold: int) -> str:
-    """Hash of WHICH cells are trainable and which are held out.
-
-    Hashes the two canonical masks rather than the index marginals, so every
-    regime is covered by one expression — including UnseenPair, whose held-out
-    unit is a scattered set of (bin, ko) pairs that no marginal describes.
-    """
-    split = store.split(scenario, fold)
-    h = hashlib.sha256()
-    for mask in (split.train_mask_2d(store.n_bins, store.n_kos),
-                 split.test_mask_2d(store.n_bins, store.n_kos)):
-        h.update(np.ascontiguousarray(mask, dtype=bool).tobytes())
-        h.update(b"|")
-    return h.hexdigest()[:16]
-
-
-def _git_head() -> Optional[str]:
-    """Short git SHA of the working tree, or None outside a repo. Advisory."""
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=5)
-        return out.stdout.strip() or None
-    except Exception:                                  # noqa: BLE001 - provenance only
-        return None

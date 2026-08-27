@@ -112,7 +112,11 @@ def test_every_registered_predictor_lands_in_a_known_category():
     """)
     assert r.returncode == 0, r.stderr[-1500:]
     cats = r.stdout.split("CATS")[1].strip()
-    known = {"analytical", "learned", "controls", "dl", "transformers"}
+    # No "transformers": the nine variants are `TorchPredictor`s and land in
+    # `dl`. Leaving it here would let one that regressed to a plain `Predictor`
+    # fall back to its module name and still satisfy `got <= known` — passing on
+    # exactly the bug this test exists to catch.
+    known = {"analytical", "learned", "controls", "dl"}
     got = set(eval(cats))
     assert got <= known, f"unexpected category (a class built oddly?): {got - known}"
 

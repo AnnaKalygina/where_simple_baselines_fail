@@ -7,8 +7,8 @@ different factorisations, against the plain-depth references `6x1, 4x1, 3x1,
 2x1`. Dropping variants dissolves the comparison.
 
 These used to be ADOPTED predictors: thin adapters that read predictions
-computed in a separate project and scored them here, with `needs_training =
-False` and a run location pointed at by an env var. They now train in-process
+computed in a separate project and scored them here, with no training step of
+their own and a run location pointed at by an env var. They now train in-process
 through `TorchPredictor`, and this repo depends on nothing outside itself.
 
 Currently exercised on `ecoli_synthetic`. The architecture puts one token per
