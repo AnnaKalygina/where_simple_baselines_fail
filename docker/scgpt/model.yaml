@@ -1,0 +1,121 @@
+# scGPT-ct run recipe — the single source of truth for how the scGPT container is
+# trained and run. Read lazily by benchmark.predictors.container_predictor.
+# SCGPTContainer (via ContainerPredictor._recipe). Benchmark *capabilities*
+# (scenarios, cell_aware, has_drop_rule) are declared in Python on the predictor
+# class, NOT here — verify reads those in a pyyaml-less env. See docker/CONTRACT.md
+# and SCGPT_NOTES.md.
+#
+# scGPT is FINE-TUNED here, not pretrained: the whole_human foundation checkpoint
+# is loaded and every parameter is then trained on the perturbation task.
+
+model_key: scgpt                                  # config `model` field
+sif_path: docker/scgpt/scgpt.sif                  # repo-relative; resolved via the customapps symlink
+entry: [python, /app_code/scgpt/run_model.py]     # argv run via `singularity exec`
+code_binds:                                       # host dir -> in-container mount (env-only sif)
+  docker/scgpt: /app_code/scgpt                   # wrapper + gene_info_scgpt.csv; no harness bind
+extra_config:                                     # model-specific keys injected verbatim into config.json
+  scgpt_pretrained_path: /opt/scgpt_pretrained    # baked whole_human checkpoint (see scgpt.def). V4
+  scgpt_gene_info_path: /app_code/scgpt/gene_info_scgpt.csv   # OOV vocabulary (V8) — the SAME file
+                                                  # the host preflight reads, so the container's drop
+                                                  # rule and the host's forecast cannot disagree
+  batch_key: batch                                # secondary control-matching key (V7); auto-disabled
+                                                  # at runtime when absent or single-level
+wandb_project: vcr-scgpt-ct                       # train only; offline unless WANDB_MODE is set (V14)
+
+# Hard ceilings, in seconds. train_timeout doubles as the abandoned-claim TTL
+# (TrainedPredictor._claim_ttl), so it is sized to the job rather than padded:
+# 15 epochs of fine-tuning, not 1000 epochs from scratch. Re-check against the
+# smoke's measured throughput before the first large dataset.
+train_timeout: 21600                              # 6 h
+predict_timeout: 7200                             # 2 h
+
+# Artefacts that must ALL exist for a run dir to count as trained (relative to it).
+# perturb_processed.h5ad is durable state: predict rebuilds PertData from the exact
+# post-OOV gene panel and condition renaming that training saw, and cannot
+# reconstruct it identically without re-running the whole conversion.
+#
+# NOT listed: processed_data/cellsimbench_scgpt/data_pyg/cell_graphs.pkl. Unlike
+# GEARS' processed_data/ (whose predict path raises without it), scGPT's predict
+# builds its own graphs from control cells and never reads it — so it is scratch,
+# not durable state, and listing it would make ~5.6 GB/fold undeletable. See V11.
+expected_artifacts:
+  - best_model.pt                                            # BEST-VAL weights (V10)
+  - vocab.json                                               # vocab WITH special tokens appended;
+                                                             # regenerating it would shift every gene_id
+  - args.json                                                # the RESOLVED architecture (V16)
+  - scgpt_training_report.json                               # covariate pinning + drops + selection
+  - processed_data/cellsimbench_scgpt/perturb_processed.h5ad # the adata training actually saw
+  - processed_data/cellsimbench_split_dict.pkl               # split provenance
+  - processed_data/cache_key.json                            # staleness guard (V15)
+
+# Hyperparameters — pinned to the AUTHORS' own perturbation fine-tuning tutorial
+# (scgpt.readthedocs.io/en/latest/tutorial_perturbation.html), which is the
+# published recipe for exactly this task. Where atheus deviated from it, the
+# authors win and the deviation is named. Do not tune toward a target.
+hyperparameters:
+  # --- architecture: DICTATED by the baked checkpoint's args.json, and asserted
+  #     against it at load (V16). These are not free choices.
+  embsize: 512
+  nheads: 8
+  d_hid: 512
+  nlayers: 12
+  n_layers_cls: 3
+  dropout: 0.2
+  # --- tokenisation
+  pad_token: "<pad>"
+  pad_value: 0                  # AUTHOR. Deliberately NOT the checkpoint's pretraining
+                                # pad_value (-2): the perturbation task feeds continuous
+                                # values, not bins (n_input_bins unset -> no binning).
+  pert_pad_id: 2                # AUTHOR
+  special_tokens: ["<pad>", "<cls>", "<eoc>"]
+  max_seq_len: 1536             # AUTHOR. atheus used 1200 — a deviation with no stated
+                                # basis. TRAIN ONLY: predict runs the full untruncated
+                                # sequence (V22).
+  include_zero_gene: "all"      # AUTHOR
+  # --- objective
+  MVC: false                    # AUTHOR (MVC = False). atheus set true, which computed the
+                                # MVC head every forward pass and NEVER added it to the loss
+                                # (V16) — pure waste, and a recipe that misdescribed the
+                                # objective.
+  CLS: false                    # AUTHOR
+  CCE: false                    # AUTHOR
+  ECS: false                    # AUTHOR
+  cell_emb_style: "cls"         # AUTHOR
+  mvc_decoder_style: "inner product, detach"   # AUTHOR (inert while MVC is false)
+  loss_reduction: "mean"        # AUTHOR. Upstream scgpt.loss.masked_mse_loss ends
+                                # `return loss / mask.sum()`. atheus reimplemented it with
+                                # reduction='sum' and never overrode it (V17). Adam is
+                                # nearly invariant to loss scale, but clip_grad_norm_(1.0)
+                                # and the fp16 GradScaler are NOT — see the V17 note.
+  # --- optimisation
+  optimizer: Adam               # AUTHOR; was hardcoded in the wrapper body (V12)
+  lr: 0.0001                    # AUTHOR (1e-4). atheus agrees.
+  weight_decay: 0.0             # atheus; the tutorial does not set one (torch default 0.0)
+  batch_size: 64                # AUTHOR. atheus used 32.
+  predict_batch_size: 32        # OURS, and flagged as ours: predict runs the FULL gene
+                                # sequence (~7.3k) rather than max_seq_len, so its memory
+                                # profile is unrelated to training's. Decoupled so that
+                                # surviving predict cannot silently retune training (V22).
+  max_epochs: 15                # AUTHOR (epochs = 15). atheus used 10.
+  early_stopping_patience: 5    # AUTHOR (early_stop = 5). atheus had no early stopping.
+  schedule_interval: 1          # AUTHOR. atheus used 15 with max_epochs 10, so its StepLR
+                                # NEVER fired — a configured decay that did nothing (V16).
+  scheduler_gamma: 0.9          # was hardcoded (V12)
+  grad_clip_norm: 1.0           # was hardcoded (V12)
+  amp: true                     # AUTHOR; also required for the flash fast path (fp16/bf16)
+  # --- data construction
+  ctrl_samples_per_cell: 1      # control donors paired per perturbed cell; was hardcoded (V12)
+  num_de_genes: 20              # was hardcoded (V12). Inert for the loss (masked_positions is
+                                # all-ones); carried because create_cell_graph stores de_idx.
+  n_cls: 1                      # was hardcoded (V12). Architectural, not tunable — the CLS
+                                # head is dead while CLS is false.
+  do_sample: true               # was hardcoded at the pred_perturb call site (V12)
+  pool_size: 300                # control cells averaged per predicted (covariate, condition);
+                                # GEARS' default, carried by atheus
+  dolog1p: false                # our h5ads are already log1p — host preflight B8 enforces it
+# DELETED from the atheus scgpt.yaml, with reasons:
+#   dohvg / n_top_genes        — never read by the wrapper
+#   model_loc / model_loc_local — encoded the /pretrained_model/ two-mount convention that
+#                                 V4 removes; replaced by extra_config.scgpt_pretrained_path
+#   weighted_residual_loss     — an atheus-invented extension (disabled by default), the
+#                                 analogue of PRESAGE's presage_gated.yaml. Not vendored.

@@ -484,8 +484,113 @@ class PRESAGEContainer(ContainerPredictor):
             return None
 
 
+@register
+class SCGPTContainer(ContainerPredictor):
+    """scGPT fine-tuned in-container on our leak-safe splits.
+
+    A second pretrained-foundation-model architecture on the perturbation axis:
+    GEARS is a GNN over a prior-knowledge graph, PRESAGE a pathway-pooled MLP,
+    scGPT a transformer fine-tuned from a whole-human checkpoint.
+
+    ``cell_aware`` is FALSE on purpose, and the reason is worth stating because it
+    is not the reason it was false for GEARS. scGPT's perturbation model
+    (``TransformerGenerator``) has no covariate input port at all — its embeddings
+    are gene token + expression value + perturbation flag, and its
+    ``domain_spec_batchnorm`` argument is accepted and never applied. Cell identity
+    can reach a prediction only through the input control cell's profile, which is
+    why the container conditions by pairing each perturbed cell with a control from
+    the SAME covariate (and batch), and why the flag is a claim about that pairing
+    rather than about an embedding.
+
+    Flipping it requires the M1.5 gate, not a code change alone: the pair-mode
+    leakage check, the in-container per-cell split assertion, AND a
+    cell-type-dependent positive control — the same KO under two cell types must
+    predict *differently*. If the control-matching is inert they come out
+    identical, and "it ran without erroring" would not have caught it. See
+    docker/scgpt/TRAINING_VALIDATION.md.
+    """
+
+    name = "scGPT-ct"
+    model_dir = "docker/scgpt"        # holds model.yaml (the run recipe)
+    cell_aware = False                # earns cell-axis regimes only via the M1.5 gate
+    scenarios = ["UnseenPert"]        # widened only with evidence
+    has_drop_rule = True              # genes/perturbations outside the scGPT vocabulary
+                                      # are dropped — quantified below, never shrugged off
+
+    #: Host copy of the scGPT reference gene list — the SAME file the container
+    #: reads via the bind mount, so this forecast and the container's actual drop
+    #: cannot disagree.
+    _GENE_INFO_HOST = REPO_ROOT / "docker" / "scgpt" / "gene_info_scgpt.csv"
+    _MIN_TARGET_COVERAGE = 0.5        # stop below this (likely a gene-ID mismatch)
+
+    def _preflight_model_specific(self, store, obs, cond, split, conds) -> None:
+        """scGPT-specific: quantify what its vocabulary will drop.
+
+        scGPT tokenises genes against a fixed ~60k-symbol vocabulary. Genes outside
+        it are dropped from the panel, and then any perturbation whose targets did
+        not survive is dropped too. Both were silent and unbounded in the source
+        this was vendored from. Quantify here so the loss is known BEFORE a GPU
+        allocation, and STOP if target coverage falls through the floor
+        (CHEAT-6 — never shrug off drops).
+        """
+        if not self._GENE_INFO_HOST.exists():
+            log.warning("%s: scGPT gene list not found at %s — VOCAB-COVERAGE CHECK "
+                        "SKIPPED (not silently OK; vendor gene_info_scgpt.csv to enable).",
+                        self.name, self._GENE_INFO_HOST)
+            return
+        import csv
+        with open(self._GENE_INFO_HOST, newline="") as fh:
+            vocab = {row["feature_name"] for row in csv.DictReader(fh)}
+
+        genes = [str(g) for g in store.gene_names]
+        gene_covered = [g for g in genes if g in vocab]
+        log.info("%s vocab coverage: %d/%d panel genes (%.1f%%) tokenizable",
+                 self.name, len(gene_covered), len(genes),
+                 100 * len(gene_covered) / max(len(genes), 1))
+
+        targets = set()
+        for c in conds["train"] + conds["val"] + conds["test"]:
+            if c in ("control", "ctrl", "ctrl_iegfp") or "ctrl" in c.lower():
+                continue  # control is not a perturbation target
+            targets.update(parse_target_genes(c))
+        targets.discard("")
+        if not targets:
+            log.warning("%s: no perturbation targets parsed — skipping coverage", self.name)
+            return
+        covered = {g for g in targets if g in vocab}
+        frac = len(covered) / len(targets)
+        dropped = sorted(targets - covered)
+        log.info("%s vocab coverage: %d/%d targets (%.1f%%) modeled; %d dropped%s",
+                 self.name, len(covered), len(targets), 100 * frac, len(dropped),
+                 f" (e.g. {dropped[:5]})" if dropped else "")
+        if frac < self._MIN_TARGET_COVERAGE:
+            raise RuntimeError(
+                f"{self.name}: only {100*frac:.1f}% of perturbation targets are in the "
+                f"scGPT vocabulary (< {100*self._MIN_TARGET_COVERAGE:.0f}% floor) — likely "
+                f"a gene-ID space mismatch, not a benign drop. Dropped e.g. {dropped[:10]}")
+
+    def _train_report(self, run_dir: Path) -> Optional[Dict]:
+        """Lift the wrapper's training report into ``fingerprint.json``.
+
+        Carries what the host-side fingerprint (a hash of the split) cannot show a
+        reader auditing this run: which epoch validation selected, which control
+        pairing tiers actually fired, what the vocabulary drop rule dropped, and
+        whether the flash fast path was live.
+        """
+        import json
+        path = run_dir / "scgpt_training_report.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError) as e:
+            log.warning("%s: unreadable %s (%s) — no training report recorded",
+                        self.name, path.name, e)
+            return None
+
+
 __all__ = ["ContainerPredictor", "GEARSContainer", "PRESAGEContainer",
-           "COVARIATE_COLUMN"]
+           "SCGPTContainer", "COVARIATE_COLUMN"]
 
 
 # ---------------------------------------------------------------------------

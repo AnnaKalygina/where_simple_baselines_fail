@@ -1,0 +1,297 @@
+# scGPT training/inference container — pinned Singularity definition (ENV ONLY).
+#
+# Design: this image holds ONLY the frozen environment (pytorch base + scGPT +
+# cell-gears + flash-attn) plus the 206 MB pretrained foundation checkpoint. Our
+# thin code (run_model.py, scgpt_wrapper.py — which inlines its own data-load
+# shim — and gene_info_scgpt.csv) is NOT baked in: it is BIND-MOUNTED from the
+# host repo at run time by benchmark/predictors/_container/runner.py, under
+# /app_code/scgpt. So the wrapper can be edited without a rebuild.
+#
+# PINS (resolved 2026-08-27; see docker/gears/BUILD_ENV.md for the build route):
+#   base       pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime
+#              @ sha256:831247999fbf7e08f61b3e39f6d77ee434f38f6f07f769d00db451e853878067
+#              (probed: python 3.11.10, torch 2.5.1+cu121 — the exact combination
+#               the flash-attn wheel below is built for, and the same torch minor
+#               the host `vcell` env runs)
+#   scGPT      github.com/bowang-lab/scGPT @ cebd6fae655b9c585a4807daa3ac31bb764f06b4
+#   cell-gears 0.0.2         torch-geometric 2.6.1        flash-attn 2.8.3
+#   sci stack  pinned to the set gears.sif proved on 2026-08-13 (see %post):
+#              pandas 2.3.3 / anndata 0.12.19 / scanpy 1.11.5 / statsmodels 0.14.6
+#   weights    whole-human (33M human cells), md5 9922ec94305126e6e4f9c1575cf493ae
+#
+# WHY A GIT SHA AND NOT `scgpt==0.2.4`. Three things arrive only after the last
+# PyPI release, each of which would otherwise be its own build hazard:
+#   1. FlashAttention 2.x support (`scgpt/model/flash_attn_compat.py`, added by
+#      PR #351 "cuda-12.8 and FlashAttention 2.x compatibility"). scgpt<=0.2.4
+#      needs `flash-attn<1.0.5`, whose kernels are built for sm75+sm80 only —
+#      i.e. on THIS cluster, titanrtx and nothing else. FA2 covers sm80/86/89/90,
+#      which is rtx3090/rtx4090/h200 — the bulk of the fleet.
+#   2. `torchtext` is gone from the dependency list. scgpt 0.2.4 requires it;
+#      torchtext is archived and does not build against modern torch. PR #351
+#      replaces it with `scgpt/tokenizer/vocab_compat.py`.
+#   3. FA2 ships PREBUILT WHEELS, so there is no nvcc, no MAX_JOBS, and no
+#      multi-hour source build on the CustomApps client.
+# Recorded as a deviation from the published release in SCGPT_NOTES.md.
+#
+# GPU REQUIREMENT — READ BEFORE SUBMITTING. flash-attn 2.x needs compute
+# capability >= 8.0. On this cluster that means rtx4090 (sm89), rtx3090 (sm86) or
+# h200 (sm90). It will NOT run on v100 (sm70) or titanrtx (sm75). Every scGPT job
+# must therefore request an explicit GPU model:
+#     sbatch --partition=gpu --gres=gpu:rtx4090:1 ...
+# A bare `--gres=gpu:1` can land on a V100 and die at the first forward pass.
+#
+# BUILD on the ETH CustomApps client (has --fakeroot + internet; see
+# docker/gears/BUILD_ENV.md). The def needs NO local files — paste it and build:
+#   mkdir -p /cluster/customapps/biomed/boeva/akalygina/singularity/scgpt
+#   cd       /cluster/customapps/biomed/boeva/akalygina/singularity/scgpt
+#   # transfer scgpt.def here -- do NOT paste it into an interactive shell; a
+#   # 12 KB paste over a flaky SSH session silently drops bytes. Pipe it instead:
+#   #   ssh <leomed> 'cat <repo>/docker/scgpt/scgpt.def' | ssh <customapps> 'cat > scgpt.def'
+#   # then verify: md5sum scgpt.def == 5be4e5c721a93e5119bd03187a112fa7 (228 lines)
+#   mkdir -p .cache .tmp        # singularity does NOT create these; it FATALs without them
+#   export SINGULARITY_CACHEDIR=$PWD/.cache SINGULARITY_TMPDIR=$PWD/.tmp
+#   chmod o+x .                 # must stay ON for the DURATION of the build: --fakeroot
+#                               # enters a user namespace and cannot chdir back without it
+#                               # ("Failed to restore current working directory")
+#   singularity build --fakeroot scgpt.sif scgpt.def    # ~4-5 GB, ~15-25 min
+#   chmod o-x .                 # AFTER the build completes, not before
+# Then, on LeoMed, point the repo at it (zero-copy; *.sif is gitignored):
+#   ln -s /cluster/customapps/biomed/boeva/akalygina/singularity/scgpt/scgpt.sif \
+#         /cluster/work/boeva/virtual_cell_reasoning/docker/scgpt/scgpt.sif
+# NEVER build or cache SIFs on /cluster/work/boeva — it is at 97%.
+
+Bootstrap: docker
+From: pytorch/pytorch@sha256:831247999fbf7e08f61b3e39f6d77ee434f38f6f07f769d00db451e853878067
+
+%post
+    set -eu
+    apt-get update && apt-get install -y --no-install-recommends git wget ca-certificates \
+        && rm -rf /var/lib/apt/lists/*
+
+    # --- sanity: the base is what we pinned it to be -------------------------
+    python - <<'PY'
+import sys, torch
+print("build base:", sys.version.split()[0], "| torch", torch.__version__)
+assert sys.version_info[:2] == (3, 11), f"expected python 3.11, got {sys.version}"
+assert torch.__version__.startswith("2.5.1"), f"expected torch 2.5.1, got {torch.__version__}"
+PY
+
+    # --- the scientific stack, PINNED ---------------------------------------
+    # These versions are the set `gears.sif` resolved on 2026-08-13 on this exact
+    # base image, and which its M0 smoke proved works end to end (read out of its
+    # /opt/gears_lockfile.txt). They are pinned rather than left to the resolver
+    # because two of them moved within a fortnight and both breakages are real:
+    #
+    #   statsmodels 0.14.6 -> 0.15.0   0.15.0 publishes no cp311 wheel, so pip
+    #                                  falls back to the sdist and needs a C
+    #                                  compiler the runtime base does not have.
+    #   pandas      2.3.3  -> 3.0.5    a MAJOR bump, and pip itself reports
+    #                                  "anndata 0.12.19 requires pandas<3" — so an
+    #                                  unpinned build silently produces an image
+    #                                  whose anndata is broken.
+    #
+    # One `pip install`, not several: the resolver must see every constraint at
+    # once. Installing a pin afterwards to "override" an earlier resolution (as an
+    # earlier draft of this file did with anndata) leaves the packages that were
+    # resolved against the old version quietly mismatched.
+    pip install --no-cache-dir \
+        "pandas==2.3.3" "scipy==1.17.1" "h5py==3.16.0" \
+        "anndata==0.12.19" "scanpy==1.11.5" "statsmodels==0.14.6" \
+        "numba==0.67.0" "llvmlite==0.49.0" "scikit-learn==1.9.0" \
+        "matplotlib==3.11.1" "seaborn==0.13.2" "patsy==1.0.2" \
+        "torch-geometric==2.6.1" "cell-gears==0.0.2" \
+        "datasets==5.0.1" "pyarrow==25.0.1" "einops==0.8.2" \
+        wandb
+    # numpy is deliberately NOT pinned: the base image supplies it through conda
+    # (2.1.2), and gears.sif proves this install set leaves it intact. Pinning it
+    # here would layer a pip numpy over the conda one for no benefit.
+    #
+    # anndata is 0.12.19, matching gears.sif — NOT the host vcell env's 0.11.4.
+    # presage.def pins the host version on the principle that the container writes
+    # h5ads the host reads back; the principle is right, but 0.11.4 loses to two
+    # facts: scanpy 1.11.5 resolves 0.12.19 (forcing it down is a fight with no
+    # upside), and the host demonstrably READS what gears.sif writes at 0.12.19 —
+    # the GEARS M0 smoke maps its predictions.h5ad through host-side tensor_map.
+    # See SCGPT_NOTES.md §6.
+
+    # --- scGPT, with --no-deps ----------------------------------------------
+    # --no-deps is deliberate. scGPT's metadata still requires `scvi-tools>=0.16,<1.0`
+    # — a 2023-era pin that drags in old jax/flax/orbax — but NOTHING in the package
+    # imports scvi_tools. Verified against this exact commit by installing it
+    # --no-deps and importing it: the only hard third-party import `import scgpt`
+    # adds is `datasets` (scbank/databank.py:10, pinned above). `einops` and
+    # `torchtext` are guarded try/except imports, and `scib` is a deferred import
+    # inside an evaluation helper we never call.
+    # No --force-reinstall either: scGPT and cell-gears both list an UNPINNED
+    # `torch`, which would upgrade the base image's pinned 2.5.1+cu121 to the
+    # latest CUDA-13 torch — defeating the base digest pin, breaking the
+    # flash-attn wheel's torch match, and risking a driver mismatch on LeoMed.
+    # (gears.def:43-47 records the same lesson.)
+    pip install --no-cache-dir --no-deps \
+        "scgpt @ git+https://github.com/bowang-lab/scGPT.git@cebd6fae655b9c585a4807daa3ac31bb764f06b4"
+
+    # --- flash-attn 2.8.3, prebuilt wheel -----------------------------------
+    # The C++ ABI variant is READ from torch rather than assumed: picking the
+    # wrong one yields an ImportError at build (loud), but only if we look.
+    # --no-deps here too: flash-attn lists an unpinned `torch`, and we already
+    # supply both of its real needs (torch 2.5.1+cu121, einops 0.8.2).
+    python - <<'PY' > /tmp/fa_url
+import torch
+abi = "TRUE" if torch._C._GLIBCXX_USE_CXX11_ABI else "FALSE"
+print("https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/"
+      f"flash_attn-2.8.3+cu12torch2.5cxx11abi{abi}-cp311-cp311-linux_x86_64.whl", end="")
+PY
+    FA_URL="$(cat /tmp/fa_url)"
+    echo "flash-attn wheel: $FA_URL"
+    pip install --no-cache-dir --no-deps "$FA_URL"
+
+    # --- import gates: fail the BUILD, not the first GPU job -----------------
+    python - <<'PY'
+import sys
+assert sys.executable.startswith("/opt/conda/"), sys.executable
+import torch, anndata, scanpy, statsmodels, numpy, pandas, datasets
+import scgpt, gears, torch_geometric
+# The symbols scgpt_wrapper.py actually uses — proves --no-deps left a usable package.
+from scgpt.model import TransformerGenerator
+from scgpt.tokenizer.gene_tokenizer import GeneVocab
+from scgpt.utils import map_raw_id_to_vocab_id
+from scgpt.utils.util import load_pretrained
+# Pin guard: if the resolver drifted, say so HERE rather than at training time.
+# pandas>=3 in particular breaks anndata, which pip only reports as a warning.
+assert pandas.__version__.startswith("2.3."), f"pandas drifted: {pandas.__version__}"
+assert anndata.__version__.startswith("0.12."), f"anndata drifted: {anndata.__version__}"
+assert statsmodels.__version__.startswith("0.14."), f"statsmodels drifted: {statsmodels.__version__}"
+print("versions:", {
+    "torch": torch.__version__, "anndata": anndata.__version__,
+    "scanpy": scanpy.__version__, "statsmodels": statsmodels.__version__,
+    "numpy": numpy.__version__, "pandas": pandas.__version__,
+    "datasets": datasets.__version__,
+    "torch_geometric": torch_geometric.__version__,
+})
+PY
+
+    # flash-attn: the PACKAGE must be installed (checkable without a GPU); whether
+    # its CUDA extension loads is a RUNTIME property of the node, so that check
+    # lives in scgpt_wrapper._record_fast_path_state (V20) rather than here. The
+    # build client has no GPU, so asserting the extension here would fail for a
+    # reason that says nothing about the image.
+    python - <<'PY'
+import importlib.metadata as md
+try:
+    _v = md.version("flash_attn")
+except md.PackageNotFoundError:
+    _v = md.version("flash-attn")
+print("flash_attn version:", _v)
+try:
+    from scgpt.model.flash_attn_compat import flash_attn_backend
+    print("flash_attn_backend (build host):", flash_attn_backend)
+except Exception as e:
+    print("flash_attn extension did not load on the build host "
+          f"({type(e).__name__}: {e}) — expected without a GPU; the runtime gate "
+          "in scgpt_wrapper._record_fast_path_state is authoritative.")
+PY
+
+    # --- pretrained foundation checkpoint (whole-human, 33M cells) -----------
+    # Baked rather than bind-mounted: 206 MB is two orders of magnitude smaller
+    # than PRESAGE's 6.4 GB cache, so no symlink farm is needed — and baking makes
+    # the image self-describing. Checksums fail the BUILD, which is also how a
+    # Google Drive rate-limit interstitial (an HTML page saved as best_model.pt)
+    # gets caught instead of surfacing as a torch.load error hours later.
+    pip install --no-cache-dir gdown
+    mkdir -p /opt/scgpt_pretrained
+    # Drive rate-limits; retry a few times before giving up. A limited response is
+    # an HTML interstitial saved as best_model.pt, which the md5 check below is what
+    # actually catches — the retry just makes the common transient case self-heal.
+    for attempt in 1 2 3; do
+        gdown --folder 1oWh_-ZRdhtoGQ2Fw24HP41FgLoomVo-y -O /opt/scgpt_pretrained --remaining-ok && break
+        echo "gdown attempt $attempt failed; retrying in 30s"
+        sleep 30
+    done
+    # gdown may nest the files one directory deep; normalise either layout.
+    if [ ! -f /opt/scgpt_pretrained/best_model.pt ]; then
+        found="$(find /opt/scgpt_pretrained -name best_model.pt -print -quit)"
+        [ -n "$found" ] || { echo "best_model.pt not found after download"; exit 1; }
+        mv "$(dirname "$found")"/* /opt/scgpt_pretrained/ 2>/dev/null || true
+    fi
+    cd /opt/scgpt_pretrained
+    echo "9922ec94305126e6e4f9c1575cf493ae  best_model.pt" | md5sum -c -
+    echo "8efa7f3ca6949e1facdaa47e539e9855  vocab.json"    | md5sum -c -
+    echo "07d28cf62c2dac56007b927d31345d45  args.json"     | md5sum -c -
+    python - <<'PY'
+import json
+a = json.load(open("/opt/scgpt_pretrained/args.json"))
+want = {"embsize": 512, "nheads": 8, "d_hid": 512, "nlayers": 12, "n_layers_cls": 3}
+got = {k: a.get(k) for k in want}
+assert got == want, f"unexpected checkpoint architecture: {got}"
+assert a.get("fast_transformer") is True, a.get("fast_transformer")
+print("checkpoint architecture OK:", got)
+PY
+    # The build runs as root under --fakeroot; the run does not. The Zenodo
+    # equivalent of this bit me on PRESAGE (presage.def:103-104): downloads can
+    # arrive mode 0750 and nothing catches it until a non-root run fails.
+    chmod -R a+rX /opt/scgpt_pretrained
+    # NOTE the outer \( \): `find A -o B -print -quit` binds `-print -quit` to the
+    # SECOND branch only (-o has lower precedence than the implicit -a), so the
+    # un-grouped form silently misses a non-traversable DIRECTORY — which is
+    # precisely the case this check exists for (PRESAGE's tarball shipped 0750
+    # dirs). Verified with a fixture; presage.def:104 still has the ungrouped form.
+    test -z "$(find /opt/scgpt_pretrained \( \( -type d ! -perm -o+rx \) -o \( -type f ! -perm -o+r \) \) -print -quit)"
+    du -sh /opt/scgpt_pretrained
+
+    # --- licences ------------------------------------------------------------
+    # scGPT is MIT, cell-gears MIT, flash-attn BSD-3-Clause — all permissive, so
+    # there is none of the non-commercial restriction that forced PRESAGE's
+    # NOTICE. MIT still requires the copyright notice to travel with the code.
+    # Globbed, because a hardcoded LICENSE filename failed the first PRESAGE build.
+    git clone --depth 1 https://github.com/bowang-lab/scGPT.git /tmp/scgpt_repo || true
+    if ls /tmp/scgpt_repo/LICENSE* /tmp/scgpt_repo/COPYING* >/dev/null 2>&1; then
+        cp $(ls /tmp/scgpt_repo/LICENSE* /tmp/scgpt_repo/COPYING* | head -1) /LICENSE
+        echo "copied upstream licence to /LICENSE"
+    else
+        echo "WARNING: no upstream LICENSE found to copy"
+    fi
+    rm -rf /tmp/scgpt_repo
+
+    # --- lockfiles for reproducible rebuilds ---------------------------------
+    pip freeze > /opt/scgpt_lockfile.txt
+    echo "scgpt_lockfile written to /opt/scgpt_lockfile.txt"
+
+%environment
+    # `python` IS the model python, which is what keeps the recipe's
+    # `entry: [python, /app_code/scgpt/run_model.py]` identical to GEARS/PRESAGE
+    # instead of needing a `conda run` entrypoint.
+    export PATH=/opt/conda/bin:$PATH
+    export SCGPT_PRETRAINED=/opt/scgpt_pretrained
+    export PYTHONUNBUFFERED=1
+    export TOKENIZERS_PARALLELISM=false
+    # scanpy's @njit(cache=True) and matplotlib otherwise try to write next to
+    # read-only sources. `:-` so a caller can still override.
+    export NUMBA_CACHE_DIR=${NUMBA_CACHE_DIR:-/tmp/numba_cache}
+    export MPLCONFIGDIR=${MPLCONFIGDIR:-/tmp/mpl_cache}
+
+%runscript
+    # Generic entry: run whatever host-mounted script the runner passes as argv.
+    exec python "$@"
+
+%labels
+    org.vcr.model scgpt
+    org.vcr.base_digest sha256:831247999fbf7e08f61b3e39f6d77ee434f38f6f07f769d00db451e853878067
+    org.vcr.scgpt_commit cebd6fae655b9c585a4807daa3ac31bb764f06b4
+    org.vcr.cell_gears 0.0.2
+    org.vcr.flash_attn 2.8.3
+    org.vcr.gpu_requirement compute capability >= 8.0 (rtx3090/rtx4090/h200; NOT v100/titanrtx)
+    org.vcr.pretrained whole-human 33M cells; md5 9922ec94305126e6e4f9c1575cf493ae
+    org.vcr.license MIT (scGPT); cell-gears MIT; flash-attn BSD-3-Clause
+    org.vcr.contract combined-form; code bind-mounted at /app_code/scgpt
+
+%help
+    scGPT perturbation-prediction container — ENVIRONMENT + pretrained weights.
+    Our code is bind-mounted from the host at run time by
+    benchmark/predictors/_container/runner.py, e.g.:
+        singularity exec --nv \
+          --bind <repo>/docker/scgpt:/app_code/scgpt:ro \
+          --bind <data>:/data:ro --bind <cfg>:/config.json:ro --bind <out>:/model_output \
+          --env PYTHONPATH=/app_code/scgpt \
+          scgpt.sif python /app_code/scgpt/run_model.py {train|predict} /config.json
+    Requires a GPU with compute capability >= 8.0 (see the header).
+    Config schema: docker/CONTRACT.md. Recipe: docker/scgpt/model.yaml.
