@@ -37,10 +37,10 @@ Levels: `--fast` (L1,L2,L4,L5 + L0 via store open; numpy-only, runs in `preproce
         `--full` (adds L3,L6; needs saved predictions; `vcell`).
 
 Run:
-  conda run -n preprocess python -m benchmark.verify --fast
-  conda run -n vcell      python -m benchmark.verify --full --dataset adamson16
-  conda run -n preprocess python -m benchmark.verify --contracts   # L4 only, no data
-  conda run -n vcell      python -m benchmark.verify --coverage --dataset mcfaline23
+  $VCELL -m benchmark.verify --fast
+  $VCELL -m benchmark.verify --full --dataset adamson16
+  $VCELL -m benchmark.verify --contracts   # L4 only, no data
+  $VCELL -m benchmark.verify --coverage --dataset mcfaline23
 """
 from __future__ import annotations
 

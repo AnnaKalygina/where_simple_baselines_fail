@@ -1,0 +1,77 @@
+# Single conda environment for this repo. Replaces environment-vcell.yml and
+# environment-preprocess.yml — every host-side script runs here: dataset
+# preprocessing (data/*/get_data.py), the benchmark CLI
+# (python -m benchmark.run_pipeline ...), the verifier (--fast/--full/--contracts)
+# and the whole pytest suite.
+#
+# Model TRAINING is NOT this environment's job: GEARS / PRESAGE / scGPT each ship
+# their own environment inside their .sif, and docker/*/ is deliberately absent
+# from the dependency set below (those wrappers import scgpt / gears /
+# torch_geometric, which must exist only inside the containers).
+#
+#   conda env create -f environment.yml -p <prefix>
+#   <prefix>/bin/python -m benchmark.run_pipeline all --dataset adamson16 ...
+#   <prefix>/bin/python scripts/check_env.py        # validates the result
+#
+# WHY A SINGLE PIP LAYER. Everything below python comes from pip on purpose. The
+# previous two environments mixed provenance per package (numpy, scikit-learn and
+# h5py from pip; scipy, pandas and seaborn from conda), which is a standing source
+# of a package that imports but misbehaves. Sourcing one layer from one place
+# makes that class of conflict structurally impossible rather than something to
+# check for. scripts/check_env.py asserts it stays that way.
+#
+# WHY THESE PINS. The numerical core is pinned to the versions whose CODE the old
+# `vcell` was running, because those produced the metrics stored under results/.
+# The scanpy/pdex chain is pinned to the old `preprocess` env, which was verified
+# clean. Presentation-only packages (matplotlib and friends) are left to resolve —
+# they do not move any number, and the old env's metadata for them was unreliable.
+name: vcell
+channels:
+  - conda-forge
+dependencies:
+  # 3.10 is required, not incidental: pdex is pinned to 0.1.28 because 0.2.0+
+  # needs python >= 3.11, and nothing in the repo needs anything newer.
+  - python=3.10
+  - pip
+  - pip:
+      # --- numerical core: pinned to the code that produced results/*.csv -------
+      - numpy==2.0.1
+      - scipy==1.15.3
+      - pandas==2.3.3
+      - scikit-learn==1.7.2
+      - h5py==3.15.1
+      - pyarrow==23.0.1            # parquet engine for xatlas_orion (used via pandas)
+      - numba==0.65.0
+      - llvmlite==0.47.0
+      - anndata==0.11.4            # EXACT: the host reads back what the containers write
+      - torch==2.5.1               # metric kernels + the in-process torch predictor tier
+
+      # --- scanpy chain: pinned to the clean `preprocess` env ------------------
+      - scanpy==1.11.5
+      - scikit-misc==0.5.2         # loess backend REQUIRED by scanpy's seurat_v3 HVG
+      - legacy-api-wrap==1.5
+      - pynndescent==0.6.0
+      - umap-learn==0.5.11
+      - igraph==1.0.0              # sc.tl.leiden backend
+      - leidenalg==0.11.0          # sc.tl.leiden backend
+
+      # --- differential expression --------------------------------------------
+      # pdex drags polars + pydeseq2 + adpbulk; pinned because 0.2.0+ needs py3.11.
+      - pdex==0.1.28
+      - polars==1.43.2
+
+      # --- declared here for the first time: imported but in NEITHER old spec ---
+      - wandb==0.23.0              # benchmark/predictors/torch_predictor.py
+      - pyyaml==6.0.3              # benchmark/predictors/container_predictor.py
+      - matplotlib                 # benchmark/scripts/ecoli_metric_grid.py
+
+      # --- pinned after the fact: NOT presentation-only -------------------------
+      # Both previous environments ran 0.14.6 / 1.0.2. statsmodels backs part of
+      # scanpy's rank_genes_groups, which data/_utils.py calls, so letting it float
+      # to whatever PyPI serves on a given day can move a number. One known-good
+      # value existed; there was no reason to drift off it.
+      - statsmodels==0.14.6
+      - patsy==1.0.2
+
+      # --- test runner ----------------------------------------------------------
+      - pytest

@@ -22,7 +22,7 @@ _utils.py + this file + the declarations below) has changed.
 
 Usage::
 
-    conda run -n preprocess python data/adamson16/get_data.py
+    $VCELL data/adamson16/get_data.py
 """
 from __future__ import annotations
 

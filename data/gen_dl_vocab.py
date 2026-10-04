@@ -24,7 +24,7 @@ Sources (confirmed in-repo / collaborator tree), one artifact per model:
 Schema (per file): {model, vocab_type, source, n_genes, genes: [...]}.
 
 Read-only inputs; writes only under data/ref/dl_model_vocab/. Run in `preprocess`:
-    conda run -n preprocess python data/gen_dl_vocab.py [--gears-gene2go PATH]
+    $VCELL data/gen_dl_vocab.py [--gears-gene2go PATH]
 """
 from __future__ import annotations
 
