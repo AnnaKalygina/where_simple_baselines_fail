@@ -11,14 +11,13 @@
 #
 #   conda env create -f environment.yml -p <prefix>
 #   <prefix>/bin/python -m benchmark.run_pipeline all --dataset adamson16 ...
-#   <prefix>/bin/python scripts/check_env.py        # validates the result
 #
 # WHY A SINGLE PIP LAYER. Everything below python comes from pip on purpose. The
 # previous two environments mixed provenance per package (numpy, scikit-learn and
 # h5py from pip; scipy, pandas and seaborn from conda), which is a standing source
 # of a package that imports but misbehaves. Sourcing one layer from one place
 # makes that class of conflict structurally impossible rather than something to
-# check for. scripts/check_env.py asserts it stays that way.
+# check for.
 #
 # WHY THESE PINS. The numerical core is pinned to the versions whose CODE the old
 # `vcell` was running, because those produced the metrics stored under results/.
