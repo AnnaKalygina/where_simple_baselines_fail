@@ -283,6 +283,39 @@ class DatasetStore:
         return set(self.gene_names)
 
     @cached_property
+    def gene_ensembl_ids(self) -> Optional[List[str]]:
+        """Per-gene Ensembl accessions, aligned to ``gene_names`` — or None.
+
+        Found by the SHAPE of the values, not by the column name: our datasets
+        spell it `ensembl_id` (adamson16, frangieh21, mcfaline23, sunshine23),
+        `ensemble_id` (norman19, misspelled) and `gene_id` (replogle20), while
+        replogle22/jiang24/wessels23/xatlas_orion carry none at all. Entries that
+        are not accessions come back as "" so callers fall back per gene
+        (frangieh21's column is only ~78 % populated).
+
+        Used by SCGPTContainer's preflight, which must forecast the same gene
+        coverage the container will actually resolve (V26).
+        """
+        import re
+        pat = re.compile(r"^ENSG\d{11}")
+        var = self._adata.var
+        best, best_frac = None, 0.0
+        for col in var.columns:
+            try:
+                vals = var[col].astype(str)
+            except Exception:
+                continue
+            frac = float(vals.str.match(pat).mean())
+            if frac > best_frac:
+                best, best_frac = col, frac
+        # Floor mirrors scgpt_wrapper.ENSEMBL_COLUMN_MIN_FRACTION — the forecast
+        # must select the same column the container will.
+        if best is None or best_frac < 0.1:
+            return None
+        vals = var[best].astype(str)
+        return [v if pat.match(v) else "" for v in vals]
+
+    @cached_property
     def gene_to_index(self) -> Dict[str, int]:
         """gene_name -> column index, built once (see gene_name_set)."""
         return {g: i for i, g in enumerate(self.gene_names)}

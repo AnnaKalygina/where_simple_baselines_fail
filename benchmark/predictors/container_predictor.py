@@ -204,8 +204,7 @@ class ContainerPredictor(TrainedPredictor):
         problems: List[str] = []
 
         # B1: a usable control label present AND ≥1 control cell in train (basal).
-        ctrl_mask = (cond.isin(["control", "ctrl", "ctrl_iegfp"])
-                     | cond.str.contains("ctrl", case=False, na=False, regex=False))
+        ctrl_mask = leakage.control_mask(cond, leakage.DEFAULT_CONTROL_LABELS)
         if not ctrl_mask.any():
             problems.append("no control cells (condition ∈ {control,ctrl,ctrl_iegfp})")
         elif not (ctrl_mask & (split == "train")).any():
@@ -245,8 +244,7 @@ class ContainerPredictor(TrainedPredictor):
         conds = _config.derive_conditions(obs, split_col)
 
         def _noctrl(cs):
-            return {c for c in cs if c not in ("control", "ctrl", "ctrl_iegfp")
-                    and "ctrl" not in c.lower()}
+            return {c for c in cs if not leakage.is_control_label(c)}
 
         overlap = _noctrl(conds["train"]) & _noctrl(conds["test"])
         if scenario not in leakage.BIN_AXIS_REGIMES and overlap:
@@ -357,10 +355,72 @@ class ContainerPredictor(TrainedPredictor):
         """Training provenance the container left behind, for ``fingerprint.json``.
 
         Default None: a container that records nothing is not an error. Subclasses
-        that do (best epoch, val loss, what was held out) lift it here — see
-        :class:`PRESAGEContainer`.
+        that do (best epoch, val loss, what was held out) lift it here with
+        :meth:`_read_json_report` — see :class:`PRESAGEContainer`.
+
+        The result is DESCRIPTIVE, never identity: `fit` files it under
+        ``fingerprint.json["report"]``, while staleness compares only
+        ``TrainedPredictor._ENFORCED``. That is what lets a report carry
+        ``wall_seconds`` without invalidating the checkpoint it describes.
         """
         return None
+
+    # ------------------------------------------------------------------
+    # Shared helpers for the concrete models below
+    # ------------------------------------------------------------------
+
+    #: Stop below this share of perturbation targets — a loss this large is a
+    #: gene-ID space mismatch, not a benign drop (CHEAT-6: never shrug off drops).
+    _MIN_TARGET_COVERAGE = 0.5
+
+    def _read_json_report(self, run_dir: Path, filename: str,
+                          key: Optional[str] = None) -> Optional[Dict]:
+        """Read one JSON report a container left in `run_dir`, or None.
+
+        Missing is not an error (the container may predate the report, or be a
+        tier that writes none); unreadable is a WARNING, not a crash, because a
+        corrupt provenance file must not destroy an otherwise valid run.
+        """
+        import json
+        path = run_dir / filename
+        if not path.exists():
+            return None
+        try:
+            doc = json.loads(path.read_text())
+        except (OSError, ValueError) as e:
+            log.warning("%s: unreadable %s (%s) — no training report recorded",
+                        self.name, path.name, e)
+            return None
+        return doc.get(key) if key else doc
+
+    def _check_target_coverage(self, conds: Dict, *, is_covered, source: str) -> None:
+        """Quantify a per-target drop rule before a GPU allocation, and STOP low.
+
+        Every drop-rule container asks the same question of a different reference
+        — GEARS of `gene2go`, scGPT of its tokenizer vocabulary — so the parsing,
+        the control skip, the floor and the message live here once. `is_covered`
+        is the only thing that varies: a predicate over one target gene symbol.
+        """
+        targets = set()
+        for c in conds["train"] + conds["val"] + conds["test"]:
+            if leakage.is_control_label(c):
+                continue  # control is not a perturbation target
+            targets.update(parse_target_genes(c))
+        targets.discard("")
+        if not targets:
+            log.warning("%s: no perturbation targets parsed — skipping coverage", self.name)
+            return
+        covered = {g for g in targets if is_covered(g)}
+        frac = len(covered) / len(targets)
+        dropped = sorted(targets - covered)
+        log.info("%s %s coverage: %d/%d targets (%.1f%%) modeled; %d dropped%s",
+                 self.name, source, len(covered), len(targets), 100 * frac, len(dropped),
+                 f" (e.g. {dropped[:5]})" if dropped else "")
+        if frac < self._MIN_TARGET_COVERAGE:
+            raise RuntimeError(
+                f"{self.name}: only {100*frac:.1f}% of perturbation targets are in "
+                f"{source} (< {100*self._MIN_TARGET_COVERAGE:.0f}% floor) — likely a "
+                f"gene-ID space mismatch, not a benign drop. Dropped e.g. {dropped[:10]}")
 
     def _infer(self, store: DatasetStore, scenario: str, fold: int,
                run_dir: Path) -> np.ndarray:
@@ -405,12 +465,10 @@ class GEARSContainer(ContainerPredictor):
     # Host copy of the gene2go pickle (same file the container reads via the bind
     # mount) — used here for the preflight coverage check.
     _GENE2GO_HOST = REPO_ROOT / "docker" / "gears" / "gene2go_all.pkl"
-    _MIN_TARGET_COVERAGE = 0.5        # stop below this (likely a gene-ID mismatch)
 
     def _preflight_model_specific(self, store, obs, cond, split, conds) -> None:
         """GEARS-specific: perturbation targets must be covered by gene2go, else
-        conditions are silently dropped (§1.3.6). Quantify coverage; STOP if it
-        falls below a floor (CHEAT-6 — never shrug off drops)."""
+        conditions are silently dropped (§1.3.6)."""
         if not self._GENE2GO_HOST.exists():
             log.warning("%s: gene2go pickle not found at %s — GENE-COVERAGE CHECK "
                         "SKIPPED (not silently OK; vendor gene2go to enable).",
@@ -420,27 +478,17 @@ class GEARSContainer(ContainerPredictor):
         with open(self._GENE2GO_HOST, "rb") as fh:
             g2g = pickle.load(fh)
         go_genes = set(g2g.keys()) if isinstance(g2g, dict) else set(g2g)
+        self._check_target_coverage(conds, is_covered=go_genes.__contains__,
+                                    source="gene2go")
 
-        targets = set()
-        for c in conds["train"] + conds["val"] + conds["test"]:
-            if c in ("control", "ctrl", "ctrl_iegfp") or "ctrl" in c.lower():
-                continue  # control is not a perturbation target
-            targets.update(parse_target_genes(c))
-        targets.discard("")
-        if not targets:
-            log.warning("%s: no perturbation targets parsed — skipping coverage", self.name)
-            return
-        covered = {g for g in targets if g in go_genes}
-        frac = len(covered) / len(targets)
-        dropped = sorted(targets - covered)
-        log.info("%s gene2go coverage: %d/%d targets (%.1f%%) modeled; %d dropped%s",
-                 self.name, len(covered), len(targets), 100 * frac, len(dropped),
-                 f" (e.g. {dropped[:5]})" if dropped else "")
-        if frac < self._MIN_TARGET_COVERAGE:
-            raise RuntimeError(
-                f"{self.name}: only {100*frac:.1f}% of perturbation targets are in "
-                f"gene2go (< {100*self._MIN_TARGET_COVERAGE:.0f}% floor) — likely a "
-                f"gene-ID space mismatch, not a benign drop. Dropped e.g. {dropped[:10]}")
+    def _train_report(self, run_dir: Path) -> Optional[Dict]:
+        """Lift the wrapper's training report into ``fingerprint.json``.
+
+        GEARS drops every condition whose targets are outside gene2go. Until this
+        existed, nothing machine-readable recorded WHICH — its scored runs could
+        not say what they had omitted.
+        """
+        return self._read_json_report(run_dir, "gears_training_report.json")
 
 
 @register
@@ -472,16 +520,8 @@ class PRESAGEContainer(ContainerPredictor):
         the two things the host-side fingerprint (a hash of the split) cannot
         show a reader auditing a cell-axis run.
         """
-        import json
-        path = run_dir / "presage_training_hparams.json"
-        if not path.exists():
-            return None
-        try:
-            return json.loads(path.read_text()).get("report")
-        except (OSError, ValueError) as e:
-            log.warning("%s: unreadable %s (%s) — no training report recorded",
-                        self.name, path.name, e)
-            return None
+        return self._read_json_report(run_dir, "presage_training_hparams.json",
+                                      key="report")
 
 
 @register
@@ -521,7 +561,6 @@ class SCGPTContainer(ContainerPredictor):
     #: reads via the bind mount, so this forecast and the container's actual drop
     #: cannot disagree.
     _GENE_INFO_HOST = REPO_ROOT / "docker" / "scgpt" / "gene_info_scgpt.csv"
-    _MIN_TARGET_COVERAGE = 0.5        # stop below this (likely a gene-ID mismatch)
 
     def _preflight_model_specific(self, store, obs, cond, split, conds) -> None:
         """scGPT-specific: quantify what its vocabulary will drop.
@@ -540,34 +579,50 @@ class SCGPTContainer(ContainerPredictor):
             return
         import csv
         with open(self._GENE_INFO_HOST, newline="") as fh:
-            vocab = {row["feature_name"] for row in csv.DictReader(fh)}
+            rows = list(csv.DictReader(fh))
+        vocab = {r["feature_name"] for r in rows}
+        by_accession = {r["feature_id"]: r["feature_name"] for r in rows}
 
+        # V26: mirror the container's resolution order — symbol identity first,
+        # then the Ensembl accession for what is left, with symbol identity
+        # winning collisions. Forecasting the OLD symbol-only join here would
+        # predict drops that will not happen and could trip the floor below on a
+        # dataset the container handles fine.
         genes = [str(g) for g in store.gene_names]
-        gene_covered = [g for g in genes if g in vocab]
-        log.info("%s vocab coverage: %d/%d panel genes (%.1f%%) tokenizable",
+        # Honour the recipe's join mode, or this forecast silently describes a
+        # different resolution than the container will perform: under
+        # `symbol_only` the accession pass must not run here either, otherwise
+        # the preflight under-predicts the drop and may not trip the floor.
+        mode = str(self.extra_config.get("gene_id_join", "ensembl_first"))
+        accessions = store.gene_ensembl_ids if mode != "symbol_only" else None
+        resolved = {}                      # our symbol -> vocabulary name
+        claimed = set()
+        for g in genes:
+            if g in vocab:
+                resolved[g] = g
+                claimed.add(g)
+        if accessions is not None:
+            for g, acc in zip(genes, accessions):
+                if g in resolved or not acc:
+                    continue
+                cand = by_accession.get(acc)
+                if cand is not None and cand not in claimed:
+                    resolved[g] = cand
+                    claimed.add(cand)
+        gene_covered = [g for g in genes if g in resolved]
+        log.info("%s vocab coverage: %d/%d panel genes (%.1f%%) tokenizable "
+                 "(%d by symbol, %d by Ensembl accession; accession column %s)",
                  self.name, len(gene_covered), len(genes),
-                 100 * len(gene_covered) / max(len(genes), 1))
+                 100 * len(gene_covered) / max(len(genes), 1),
+                 sum(1 for g in gene_covered if resolved[g] == g),
+                 sum(1 for g in gene_covered if resolved[g] != g),
+                 "present" if accessions is not None
+                 else ("disabled by gene_id_join=symbol_only" if mode == "symbol_only"
+                       else "ABSENT — symbols only"))
 
-        targets = set()
-        for c in conds["train"] + conds["val"] + conds["test"]:
-            if c in ("control", "ctrl", "ctrl_iegfp") or "ctrl" in c.lower():
-                continue  # control is not a perturbation target
-            targets.update(parse_target_genes(c))
-        targets.discard("")
-        if not targets:
-            log.warning("%s: no perturbation targets parsed — skipping coverage", self.name)
-            return
-        covered = {g for g in targets if g in vocab}
-        frac = len(covered) / len(targets)
-        dropped = sorted(targets - covered)
-        log.info("%s vocab coverage: %d/%d targets (%.1f%%) modeled; %d dropped%s",
-                 self.name, len(covered), len(targets), 100 * frac, len(dropped),
-                 f" (e.g. {dropped[:5]})" if dropped else "")
-        if frac < self._MIN_TARGET_COVERAGE:
-            raise RuntimeError(
-                f"{self.name}: only {100*frac:.1f}% of perturbation targets are in the "
-                f"scGPT vocabulary (< {100*self._MIN_TARGET_COVERAGE:.0f}% floor) — likely "
-                f"a gene-ID space mismatch, not a benign drop. Dropped e.g. {dropped[:10]}")
+        # V26: a target counts as covered if EITHER route resolved it.
+        self._check_target_coverage(conds, is_covered=resolved.__contains__,
+                                    source="the scGPT vocabulary")
 
     def _train_report(self, run_dir: Path) -> Optional[Dict]:
         """Lift the wrapper's training report into ``fingerprint.json``.
@@ -577,16 +632,7 @@ class SCGPTContainer(ContainerPredictor):
         pairing tiers actually fired, what the vocabulary drop rule dropped, and
         whether the flash fast path was live.
         """
-        import json
-        path = run_dir / "scgpt_training_report.json"
-        if not path.exists():
-            return None
-        try:
-            return json.loads(path.read_text())
-        except (OSError, ValueError) as e:
-            log.warning("%s: unreadable %s (%s) — no training report recorded",
-                        self.name, path.name, e)
-            return None
+        return self._read_json_report(run_dir, "scgpt_training_report.json")
 
 
 __all__ = ["ContainerPredictor", "GEARSContainer", "PRESAGEContainer",

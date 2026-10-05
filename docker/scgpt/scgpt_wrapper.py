@@ -15,6 +15,7 @@ Contract: docker/CONTRACT.md. Entry: run_model.py {train|predict} /config.json.
 
 import logging
 import pickle
+import re
 import json
 import os
 import random
@@ -95,6 +96,65 @@ CONTROL_LABELS = ("ctrl", "ctrl_iegfp", "control", "non-targeting")
 
 #: scGPT's own canonical control label inside PertData.
 SCGPT_CTRL = "ctrl"
+
+# VENDORED (V26). An Ensembl gene accession, used to FIND the accession column by the
+# shape of its values rather than by its name: our h5ads spell it `ensembl_id`
+# (adamson16, frangieh21, mcfaline23, sunshine23), `ensemble_id` (norman19 — misspelled)
+# and `gene_id` (replogle20), and frangieh21's column is only 77.5 % accessions, so the
+# choice must also survive a partly-populated column.
+def _pert_flag_vector(n_genes, pert_idx=None):
+    """The per-gene perturbation flag row: ``1`` where perturbed, ``0`` elsewhere.
+
+    VENDORED (V25 + V27). ONE definition on purpose. Train and predict each built
+    this vector themselves, and they DISAGREED: predict used
+    ``pert_feats[abs(p)] = np.sign(p)`` (inherited from GEARS, where the sign
+    encodes direction) while train used a flat ``1``. Since scGPT's flag
+    vocabulary is {0 = unperturbed, 1 = perturbed, 2 = pad} and ``np.sign(0) == 0``,
+    a perturbation on the FIRST gene of the panel was flagged "unperturbed" at
+    predict only. Two copies is how that happened; one copy is why it cannot
+    happen again.
+
+    ``n_genes`` is passed explicitly rather than derived, because the callers hold
+    different shapes: ``create_cell_graph`` has a stacked ``(k, n_genes)`` array,
+    ``create_cell_graph_for_prediction`` a single ``(n_genes,)`` profile.
+
+    VENDORED (V27): a NEGATIVE index is refused, not folded through ``abs()``.
+    ``SCGPTPertData.get_pert_idx`` returns ``[-1]`` as its "gene not in
+    gene_names" sentinel, and ``int(np.abs(-1)) == 1`` — so the sentinel silently
+    marked gene index 1 as the perturbed gene and the model trained on a
+    confidently mislabelled graph. The V9/V26 drop rule removes such conditions
+    before graphs are built, so reaching this means the two disagree; that is
+    worth an exception, not a quietly wrong flag.
+    """
+    flags = np.zeros(n_genes)
+    if pert_idx is None:
+        return flags                     # controls carry no perturbation flag
+    for p in pert_idx:
+        idx = int(p)
+        if idx < 0:
+            raise ValueError(
+                f"perturbation index {idx} is the 'gene not found' sentinel, but "
+                f"the condition reached graph building anyway — the drop rule "
+                f"(V9/V26) and the index lookup disagree (V27).")
+        # Some GEARS PertData versions return indices into a superset of the
+        # dataset's gene list (e.g. pert genes not in the HVG panel). Skip those:
+        # they have no feature column to mark.
+        if idx < n_genes:
+            flags[idx] = 1
+    return flags
+
+
+ENSEMBL_GENE_RE = re.compile(r"^ENSG\d{11}")
+#: Minimum fraction of a column's values that must look like accessions for it to be
+#: taken as THE accession column. Deliberately low: `ENSG` + 11 digits is specific
+#: enough that a coincidental match is not a realistic failure mode, every value is
+#: validated per gene against the vocabulary's feature_id bijection anyway, and the
+#: real case is a PARTLY populated column (frangieh21's is 77.5 %). A high floor
+#: would throw away the accessions such a column does carry. Kept non-zero so a
+#: single stray value cannot elect an unrelated column. Mirrored by
+#: DatasetStore.gene_ensembl_ids — keep the two in step.
+ENSEMBL_COLUMN_MIN_FRACTION = 0.1
+GENE_ID_JOIN_MODES = ("ensembl_first", "symbol_only")
 
 
 def _is_control_label(name) -> bool:
@@ -613,8 +673,9 @@ class SCGPTPertData(PertData):
         """Predict-time loader: read the processed h5ad WITHOUT the graph pickle.
 
         VENDORED (V11). ``_generate_predictions`` builds its own graphs from
-        control cells via ``create_cell_graph_dataset_for_prediction`` and never
-        touches ``dataset_processed``; the atheus predict path nonetheless
+        covariate-matched control cells (``_sample_control_pool`` ->
+        ``create_cell_graph_for_prediction``) and never touches
+        ``dataset_processed``; the atheus predict path nonetheless
         unpickled the whole multi-GB ``cell_graphs.pkl``. Measured on adamson16
         that is ~5.6 GB of RAM read and discarded.
         """
@@ -632,16 +693,7 @@ class SCGPTPertData(PertData):
 
     def create_cell_graph(self, X, y, de_idx, pert, pert_idx=None,
                           cov="", split="", batch=""):
-        pert_feats = np.zeros(len(X[0]))
-        if pert_idx is not None:
-            n_genes = len(pert_feats)
-            for p in pert_idx:
-                idx = int(np.abs(p))
-                # Some GEARS PertData versions return indices into a superset of
-                # the dataset's gene list (e.g. pert genes not in HVG). Skip
-                # those — they have no feature column to mark.
-                if 0 <= idx < n_genes:
-                    pert_feats[idx] = 1
+        pert_feats = _pert_flag_vector(len(X[0]), pert_idx)
         pert_feats = np.expand_dims(pert_feats, 0)
         feature_mat = torch.Tensor(np.concatenate([X, pert_feats])).T
         # VENDORED (V6): `split` is the source cell's per-cell obs[split_name]
@@ -773,23 +825,9 @@ class SCGPTPertData(PertData):
         for one perturbation, silently. Training already used a flat ``1``
         (`create_cell_graph`); this makes predict agree.
         """
-        pert_feats = np.zeros(len(X))
-        n_genes = len(pert_feats)
-        for p in pert_idx:
-            idx = int(np.abs(p))
-            if 0 <= idx < n_genes:
-                pert_feats[idx] = 1
+        pert_feats = _pert_flag_vector(len(X), pert_idx)
         feature_mat = torch.Tensor(np.vstack([X, pert_feats])).T
         return Data(x=feature_mat, pert=pert_gene)
-
-    def create_cell_graph_dataset_for_prediction(self, pert_gene, ctrl_adata,
-                                                 gene_names, device, num_samples=300):
-        """VENDORED (V3): draws from ``self.rng`` so predict is reproducible."""
-        pert_idx = [np.where(p == np.array(gene_names))[0][0] for p in pert_gene]
-        picks = self.rng.integers(0, len(ctrl_adata), num_samples)
-        Xs = _dense_matrix(ctrl_adata[picks, :].X)
-        return [self.create_cell_graph_for_prediction(X, pert_idx, pert_gene).to(device)
-                for X in Xs]
 
 
 def _dense_matrix(X) -> np.ndarray:
@@ -878,7 +916,8 @@ class SCGPTWrapper:
         self._save_model(output_dir)
         self._save_metadata(output_dir)
         self._report['wall_seconds'] = round(time.time() - t0, 1)
-        self._write_training_report(output_dir)
+        self._write_report(output_dir, 'scgpt_training_report.json',
+                           architecture=getattr(self, '_resolved_arch', None))
         log.info("Training completed successfully")
 
     # ---------------------------------------------------------------- predict
@@ -907,6 +946,8 @@ class SCGPTWrapper:
         output_path = self.config['output_path']
         log.info("Saving predictions to %s", output_path)
         predictions_adata.write_h5ad(output_path)
+        self._write_report(Path(output_path).parent, 'scgpt_predict_report.json',
+                           model_path=self.config['model_path'])
         log.info("Prediction completed successfully")
 
     # ------------------------------------------------------------ OOV masking
@@ -933,41 +974,150 @@ class SCGPTWrapper:
             + ". Set extra_config.scgpt_gene_info_path in docker/scgpt/model.yaml."
         )
 
-    def _ensure_symbol_scgpt(self, adata: AnnData) -> None:
-        """Fill ``var['symbol_scgpt']`` and mask genes outside the scGPT vocabulary.
+    @staticmethod
+    def _detect_ensembl_column(adata: AnnData) -> Optional[str]:
+        """The `var` column holding Ensembl gene accessions, chosen by VALUE shape.
 
-        VENDORED (V9): the mask is unchanged, but the drop is now COUNTED and
-        recorded. Downstream this drops genes from the panel and then drops any
-        perturbation whose targets did not survive — both silent and unbounded in
-        the atheus source. ``SCGPTContainer.has_drop_rule = True`` plus the host
-        preflight coverage floor are the other half of this fix.
+        VENDORED (V26). Keying on the column NAME would be wrong three times over
+        across our own datasets: the name varies (`ensembl_id`, `ensemble_id`,
+        `gene_id`), a plausibly-named column need not hold accessions, and
+        frangieh21's is only 77.5 % populated. So score every column by the
+        fraction of values that look like an accession and take the best, with a
+        floor; genes whose own value is blank or malformed fall through to the
+        symbol route one by one in ``_ensure_symbol_scgpt``.
+        """
+        best, best_frac = None, 0.0
+        for col in adata.var.columns:
+            if col == "symbol_scgpt":
+                continue
+            try:
+                vals = adata.var[col].astype(str)
+            except Exception:
+                continue
+            frac = float(vals.str.match(ENSEMBL_GENE_RE).mean())
+            if frac > best_frac:
+                best, best_frac = col, frac
+        return best if best_frac >= ENSEMBL_COLUMN_MIN_FRACTION else None
+
+    def _ensure_symbol_scgpt(self, adata: AnnData) -> None:
+        """Resolve every gene to its scGPT vocabulary name in ``var['symbol_scgpt']``.
+
+        VENDORED (V9 + V26). V9 made the drop counted and recorded. **V26 changes
+        what is dropped at all.**
+
+        The atheus source matched our genes to the vocabulary by HGNC SYMBOL. HGNC
+        renames genes; our h5ads were annotated before several renames and scGPT's
+        vocabulary (cellxgene census) after them, so genes scGPT knows perfectly
+        well were discarded under their old names — `AARS`/`AARS1`,
+        `ATP5B`/`ATP5F1B`, `SRPR`/`SRPRA`, `SLMO2`/`PRELID3B`. On adamson16 that
+        was 965 genes and 11 of 89 perturbation targets, i.e. an 11.7 % "OOV" rate
+        that was a property of OUR JOIN, not of scGPT.
+
+        ``gene_info_scgpt.csv`` carries `feature_id` (Ensembl) beside
+        `feature_name`, and it is a clean bijection (60 664 unique on both), so the
+        accession is the stable key. Resolution is per gene, in order:
+
+          1. SYMBOL IDENTITY — our symbol is in the vocabulary. Wins outright.
+          2. ENSEMBL — our accession resolves to a vocabulary name that no
+             symbol-identity match has already claimed.
+          3. otherwise NaN, and the gene is dropped exactly as before.
+
+        **Symbol identity wins collisions**, which makes this change strictly
+        ADDITIVE: the Ensembl route may only add genes, never displace one the old
+        join kept. Collisions are real, not hypothetical — adamson16's
+        `RP11-343N15.1` (ENSG00000230806) resolves by accession to `SRGAP2-AS1`,
+        which our gene literally named `SRGAP2-AS1` (ENSG00000233501) already holds
+        by symbol. Left unhandled, ``gene_ids`` would carry a duplicate token and
+        ``np.where(p == gene_names)[0][0]`` would silently pick the first.
+
+        The resulting column is the ONLY place the scGPT namespace exists: it is
+        consumed by the tokenizer and nothing else. ``var_names`` and
+        ``var['gene_name']`` stay in OUR symbol namespace, so predictions,
+        conditions and DE genes need no translation back.
         """
         if getattr(self, "_oov_masked", False):
             return   # idempotent: this is called again via _prep_adata_for_scgpt,
                      # by which point the panel is already subset and re-running
                      # would overwrite the report with post-drop counts.
-        if "symbol_scgpt" not in adata.var.columns:
-            if "gene_name" in adata.var.columns:
-                adata.var["symbol_scgpt"] = adata.var["gene_name"].astype(str)
-                log.info("symbol_scgpt missing: filled from var['gene_name']")
-            else:
-                adata.var["symbol_scgpt"] = pd.Index(adata.var_names).astype(str)
-                log.info("symbol_scgpt missing: filled from var_names")
+
+        mode = str(self.config.get('gene_id_join', 'ensembl_first'))
+        if mode not in GENE_ID_JOIN_MODES:
+            raise ValueError(
+                f"gene_id_join must be one of {GENE_ID_JOIN_MODES}, got {mode!r}")
 
         gene_info_path = self._scgpt_gene_info_path()
         gene_info = pd.read_csv(gene_info_path)
-        valid = set(gene_info["feature_name"].astype(str))
-        sym = adata.var["symbol_scgpt"].astype(str)
-        oov = ~sym.isin(valid) & sym.notna()
-        n_oov = int(oov.sum())
-        if n_oov:
-            adata.var.loc[oov, "symbol_scgpt"] = np.nan
+        vocab_names = set(gene_info["feature_name"].astype(str))
+        by_accession = dict(zip(gene_info["feature_id"].astype(str),
+                                gene_info["feature_name"].astype(str)))
+
+        ours = [str(g) for g in adata.var_names]
+
+        # Pass 1 — symbol identity. This set is exactly what the old join kept.
+        resolved: List[Optional[str]] = [g if g in vocab_names else None for g in ours]
+        n_symbol = sum(r is not None for r in resolved)
+        claimed = {r for r in resolved if r is not None}
+
+        # Pass 2 — accessions, for the genes pass 1 could not place.
+        ens_col, n_ensembl, n_collisions = None, 0, 0
+        if mode == 'ensembl_first':
+            ens_col = self._detect_ensembl_column(adata)
+            if ens_col is None:
+                log.info("V26: no Ensembl accession column in var (looked at %s) — "
+                         "symbol-only resolution for this dataset",
+                         list(adata.var.columns)[:8])
+            else:
+                accessions = adata.var[ens_col].astype(str).to_numpy()
+                for i, r in enumerate(resolved):
+                    if r is not None:
+                        continue
+                    candidate = by_accession.get(accessions[i])
+                    if candidate is None:
+                        continue
+                    if candidate in claimed:
+                        # Another of our genes already holds this vocabulary token.
+                        n_collisions += 1
+                        log.warning(
+                            "V26 collision: %r (%s) resolves to vocabulary name %r, "
+                            "already claimed — dropping it rather than emitting a "
+                            "duplicate token", ours[i], accessions[i], candidate)
+                        continue
+                    resolved[i] = candidate
+                    claimed.add(candidate)
+                    n_ensembl += 1
+
+        adata.var["symbol_scgpt"] = pd.Series(resolved, index=adata.var_names,
+                                              dtype=object)
+        kept = [r for r in resolved if r is not None]
+        n_unresolved = len(ours) - len(kept)
+
+        # Structural post-conditions. A duplicate would make two of our genes share
+        # one vocabulary token; losing a symbol-identity match would mean the
+        # namespaces got crossed somewhere.
+        if len(set(kept)) != len(kept):
+            raise RuntimeError(
+                "V26: gene resolution is not injective — two genes share a "
+                "vocabulary name. The collision rule failed.")
+        if len(kept) < n_symbol:
+            raise RuntimeError(
+                f"V26: resolution kept {len(kept)} genes, fewer than the "
+                f"{n_symbol} the symbol join alone would keep — it must be additive.")
+
         self._report['n_genes_in'] = int(adata.n_vars)
-        self._report['n_genes_oov_dropped'] = n_oov
+        self._report['n_genes_oov_dropped'] = int(n_unresolved)
+        self._report['gene_id_join'] = mode
+        self._report['ensembl_column'] = ens_col
+        self._report['n_genes_matched_by_symbol'] = int(n_symbol)
+        self._report['n_genes_matched_by_ensembl'] = int(n_ensembl)
+        self._report['n_genes_unresolved'] = int(n_unresolved)
+        self._report['n_gene_id_collisions'] = int(n_collisions)
         self._oov_masked = True
         log.info(
-            "OOV mask: %d/%d genes are not in the scGPT vocabulary and will be "
-            "dropped (reference: %s)", n_oov, adata.n_vars, gene_info_path,
+            "V26 gene resolution (%s, accession column %r): %d/%d genes tokenizable "
+            "— %d by symbol, %d recovered by accession, %d unresolved (dropped), "
+            "%d collisions (reference: %s)",
+            mode, ens_col, len(kept), adata.n_vars, n_symbol, n_ensembl,
+            n_unresolved, n_collisions, gene_info_path,
         )
 
     # -------------------------------------------------------- data conversion
@@ -1068,7 +1218,11 @@ class SCGPTWrapper:
         # Combos ("A+B") need each part checked individually — comparing the whole
         # string against gene names dropped every combo.
         adata_scgpt = adata_scgpt[:, adata_scgpt.var.symbol_scgpt.notna().values]
-        known_genes = set(adata_scgpt.var.symbol_scgpt.values)
+        # VENDORED (V26): OUR symbols, because `p` below is a condition string from
+        # the host and is in our namespace. Before V26 symbol_scgpt held our symbols
+        # too, so this read either way; now it holds scGPT's, and taking it here
+        # would drop every perturbation whose target scGPT renamed.
+        known_genes = set(map(str, adata_scgpt.var_names))
         all_perts = list(adata_scgpt.obs['condition'].unique())
         perts_to_keep, perts_dropped = [], []
         for p in all_perts:
@@ -1196,7 +1350,11 @@ class SCGPTWrapper:
         """Rename conditions into scGPT/GEARS form and assert the input shape."""
         log.info("Preprocessing AnnData for scGPT ...")
         self._ensure_symbol_scgpt(adata)
-        adata.var["gene_name"] = adata.var.symbol_scgpt
+        # VENDORED (V26): gene_name stays in OUR symbol namespace. It feeds
+        # pert_data.gene_names, which is matched against condition target tokens
+        # (`ctrl+AARS`) that arrive from the host in our symbols. The scGPT name
+        # lives only in var['symbol_scgpt'] and is read only by the tokenizer.
+        adata.var["gene_name"] = pd.Index(adata.var_names).astype(str)
 
         def fix_condition(condition):
             if _is_control_label(condition):
@@ -1334,16 +1492,24 @@ class SCGPTWrapper:
             if s not in self.vocab:
                 self.vocab.append_token(s)
 
+        # VENDORED (V26): the tokenizer — and ONLY the tokenizer — reads the scGPT
+        # namespace. At predict this column comes from the perturb_processed.h5ad
+        # written by train, so the mapping is frozen into the trained artefact and
+        # cannot resolve differently than it did during fine-tuning.
+        if "symbol_scgpt" not in self.pert_data.adata.var.columns:
+            raise RuntimeError(
+                "var['symbol_scgpt'] is missing from the processed dataset — it "
+                "carries the gene->vocabulary mapping (V26). Re-run training.")
+        scgpt_names = self.pert_data.adata.var["symbol_scgpt"].astype(str)
         self.pert_data.adata.var["id_in_vocab"] = [
-            1 if gene in self.vocab else -1
-            for gene in self.pert_data.adata.var["gene_name"]
+            1 if gene in self.vocab else -1 for gene in scgpt_names
         ]
         gene_ids_in_vocab = np.array(self.pert_data.adata.var["id_in_vocab"])
         log.info("Matched %d/%d genes in vocabulary of size %d",
                  int(np.sum(gene_ids_in_vocab >= 0)), len(gene_ids_in_vocab),
                  len(self.vocab))
 
-        genes = self.pert_data.adata.var["gene_name"].tolist()
+        genes = scgpt_names.tolist()   # V26: vocabulary namespace
         self.vocab.set_default_index(self.vocab["<pad>"])
         self.gene_ids = np.array(
             [self.vocab[g] if g in self.vocab else self.vocab["<pad>"] for g in genes],
@@ -1975,19 +2141,25 @@ class SCGPTWrapper:
         with open(output_dir / 'metadata.json', 'w') as f:
             json.dump(metadata, f, indent=2, cls=PathEncoder)
 
-    def _write_training_report(self, output_dir: Path):
-        """The report the host lifts into fingerprint.json via _train_report.
+    def _write_report(self, output_dir: Path, filename: str, **extra):
+        """Write one JSON provenance report next to the run's artefacts.
 
-        Everything a reader auditing this run needs and the host-side fingerprint
-        (a hash of the split) cannot show: which epoch was selected, which control
-        pairing tiers fired, what the drop rule dropped, and whether the fast path
-        was actually live.
+        Both modes record the same core — what this run was asked to do and what
+        it observed — so there is one writer, not two that drift. The host lifts
+        the training one into ``fingerprint.json`` via ``_train_report``.
+
+        The predict-side report exists because of V9: ``dropped_test_conditions``
+        was computed, logged and then DISCARDED, so a test KO outside the scGPT
+        vocabulary became an all-NaN slice host-side with nothing machine-readable
+        to explain it — and the train-side ``dropped_perturbations`` structurally
+        CANNOT name it, because the V6 filter removes test cells before the drop
+        scan runs.
         """
         report = dict(self._report)
         report['seed'] = self.seed
         report['split_name'] = self.split_name
         report['data_path'] = self.config['data_path']
-        report['architecture'] = getattr(self, '_resolved_arch', None)
-        path = output_dir / 'scgpt_training_report.json'
+        report.update(extra)
+        path = output_dir / filename
         path.write_text(json.dumps(report, indent=2, cls=PathEncoder, sort_keys=True))
-        log.info("Wrote training report to %s", path)
+        log.info("Wrote %s (%d fields)", path, len(report))

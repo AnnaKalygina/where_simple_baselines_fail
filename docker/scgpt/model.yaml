@@ -20,6 +20,15 @@ extra_config:                                     # model-specific keys injected
                                                   # rule and the host's forecast cannot disagree
   batch_key: batch                                # secondary control-matching key (V7); auto-disabled
                                                   # at runtime when absent or single-level
+  gene_id_join: ensembl_first                     # V26. How our genes are matched to scGPT's 60 664-token
+                                                  # vocabulary. "ensembl_first": symbol identity, then the
+                                                  # Ensembl accession for whatever is left (accession column
+                                                  # auto-detected by value shape, per gene, so a dataset
+                                                  # without one degrades to symbols). "symbol_only"
+                                                  # reproduces the pre-V26 join exactly.
+                                                  # Symbols drift (AARS->AARS1, ATP5B->ATP5F1B); accessions
+                                                  # do not, so symbol-only silently discarded 965 adamson16
+                                                  # genes and 11 of 89 targets that scGPT actually knows.
 wandb_project: vcr-scgpt-ct                       # train only; offline unless WANDB_MODE is set (V14)
 
 # Hard ceilings, in seconds. train_timeout doubles as the abandoned-claim TTL
@@ -82,6 +91,12 @@ hyperparameters:
   ECS: false                    # AUTHOR
   cell_emb_style: "cls"         # AUTHOR
   mvc_decoder_style: "inner product, detach"   # AUTHOR (inert while MVC is false)
+  use_fast_transformer: true    # AUTHOR (the tutorial sets True). FlashAttention-2 2.8.3
+                                # is baked in and the fleet's rtx3090/4090/h200 are sm86/89/90,
+                                # so the fast path is reachable. scGPT flips this to False with
+                                # only a WARNING if flash-attn will not import, so the wrapper
+                                # asserts requested == effective and records the resolved
+                                # backend + FlashMHA module count in the report (V20).
   loss_reduction: "mean"        # AUTHOR. Upstream scgpt.loss.masked_mse_loss ends
                                 # `return loss / mask.sum()`. atheus reimplemented it with
                                 # reduction='sum' and never overrode it (V17). Adam is

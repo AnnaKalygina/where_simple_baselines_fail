@@ -267,3 +267,32 @@ bind-mounted; see `BUILD_ENV.md`).
   **stop** (likely ID mismatch) rather than proceed and call it fine.
 - **CHEAT-2 — "it ran and the Pearson looks plausible."** A plausible metric is not evidence of
   correctness; the cheap preflight asserts must run every time.
+
+---
+
+## 5. Run reports (added 2026-09-07)
+
+GEARS declares `has_drop_rule = True` and drops every condition whose targets are outside
+`gene2go` — at `gears_wrapper.py:~1135` for the train/val/test split lists, and again in the
+predict path for test conditions. Both drops were **logged and discarded**: the wrapper wrote
+no report at all, so a scored run carried no machine-readable record of what it had omitted,
+and an all-NaN row in the metrics could not be explained without re-reading the SLURM log.
+This is the same defect class as scGPT's V9 (see `docker/scgpt/SCGPT_NOTES.md` §7).
+
+Two files are now written, mirroring scGPT:
+
+| file | contains | required? |
+|---|---|---|
+| `gears_training_report.json` | `n_cells_total` / `n_cells_trainval` / `n_test_cells_in_training` from the per-cell split filter, `dropped_conditions_by_split` + `n_dropped_conditions` from the gene2go filter, `epochs` / `lr` / `weight_decay`, seed and split name | **yes** — in `model.yaml: expected_artifacts` |
+| `gears_predict_report.json` | `dropped_test_conditions` — the conditions predict could not model | no (predict runs after the completeness check) |
+
+`GEARSContainer._train_report` lifts the first into `fingerprint.json["report"]`, where it is
+**descriptive, never identity**: staleness compares only `TrainedPredictor._ENFORCED`
+(`seed`, `gene_axis_sha`, `split_sha`, `recipe_sha`), so a report may carry timings without
+invalidating the checkpoint it describes.
+
+> **Putting the training report in `expected_artifacts` invalidates every GEARS-ct checkpoint
+> trained before this change.** `TrainedPredictor.unusable_reason` requires each expected
+> artifact to exist, so pre-existing folds now read as incomplete and must be retrained. That
+> was the deliberate choice: a run whose drop set cannot be recovered should not count as
+> trained.

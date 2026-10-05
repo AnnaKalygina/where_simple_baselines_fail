@@ -101,6 +101,8 @@ Each is marked in-place with the same `Vn` tag used here.
 | **V22** | give predict its own `predict_batch_size`; assert the output h5ad's shape | `pred_perturb` with `include_zero_gene="all"` runs the **full untruncated** gene sequence (~7.3 k for adamson16) rather than `max_seq_len`, so predict's memory profile is unrelated to training's. Lowering `batch_size` to survive predict would silently retune training. The output asserts (unique `var_names`, finite, log1p-ranged) move a `tensor_map`-time failure to before the write. |
 | **V23** | make train and val use the same gene-subset policy, indexed correctly, under explicit generators | Train drew a *random* `max_seq_len` subset per batch via `torch.randperm(len(input_gene_ids))[:max_seq_len]` — which returns **positions, not gene ids**, coinciding with gene ids only because `include_zero_gene == "all"` makes the input `arange`; under `"batch-wise"` it indexed the wrong space. Validation meanwhile took a plain prefix, so `best_val_loss` selected on an arbitrary gene prefix. |
 | **V25** | flag the perturbed gene with a flat `1` at predict, not `np.sign(p)` | Inherited from GEARS, where the sign encodes direction. scGPT's flag vocabulary is {0 = unperturbed, 1 = perturbed, 2 = pad}, and `np.sign(0) == 0` — so a perturbation whose target is the **first gene of the panel** was flagged "unperturbed" at predict and the model was handed a control cell with no perturbation. It would then faithfully predict the control profile, for that one perturbation, silently. Training already used a flat `1`; predict now agrees. |
+| **V26** | resolve genes to the vocabulary by **Ensembl accession**, not by HGNC symbol (symbol identity first, accession for the remainder, symbol wins collisions) | The atheus source matched by symbol. HGNC renames genes, so genes scGPT knows were discarded under their old names — `AARS`/`AARS1`, `ATP5B`/`ATP5F1B`, `SRPR`/`SRPRA`, `SLMO2`/`PRELID3B`. On adamson16 that silently cost **965 genes and 11 of 89 perturbation targets**, i.e. the "11.7 % OOV rate" was a property of OUR JOIN, not of scGPT. See §8. |
+| **V27** | refuse a NEGATIVE perturbation index instead of folding it through `abs()` | `SCGPTPertData.get_pert_idx` returns `[-1]` as its "gene not in `gene_names`" sentinel, and `int(np.abs(-1)) == 1` — so the sentinel silently marked **gene index 1** as the perturbed gene and the model trained on a confidently mislabelled graph. Found while extracting `_pert_flag_vector` (the V25 site). Currently unreachable — the V9/V26 drop rule removes such conditions before graphs are built — so reaching it means the drop rule and the index lookup disagree, which is worth an exception rather than a quietly wrong flag. |
 | **V24** | host-owned files — **checked, absent** | The container writes only `best_model.pt`, `vocab.json`, `args.json`, `metadata.json`, `scgpt_training_report.json` and its `processed_data/` tree. No `fingerprint.json`, `RUNNING.json`, `train_config.json` or `predict_config.json`. Clobbering `fingerprint.json` would make a stale checkpoint look valid — the failure the contract works hardest to prevent. |
 
 ### Deviation recorded: batch matching at predict
@@ -246,4 +248,155 @@ trunk still landed. The `Wqkv.` -> `in_proj_` rename keyed on
 
 ## 7. Smoke / M1 results
 
-_Not yet run. Fill from the Tier-2 smoke and the M1 gate; see `TRAINING_VALIDATION.md`._
+### G1 — Tier-2 smoke: **PASSED** (2026-08-28, job 9543487, post-V26)
+
+adamson16 / UnseenPert / fold0, `max_epochs=1`, RTX 4090 (sm89), 4 CPU / 64 GB.
+Driver: `/cluster/home/akalygina/scgpt_smoke_driver.py`. `TRAIN rc 0`, `PREDICT rc 0`,
+7/7 expected artefacts, `SMOKE OK`.
+
+Run 9542491 passed the same gates **before** V26 and is superseded; where the two differ
+the pre-V26 value is given in brackets. The V26 delta: predictions `(18, 8086)` not
+`(17, 7285)`, **zero** dropped perturbations and **zero** dropped test conditions, and a
+delta-tensor finite fraction of **0.980** (= 8 086/8 250) rather than 0.834.
+
+| measured | value | what it settles |
+|---|---|---|
+| `flash_attn_backend` / effective | `fa2` / `true` | V20 — the fast path the recipe claims is live, not a silent dense fallback |
+| flash modules | 24 = 12 `FlashTransformerEncoderLayer` + 12 `MHA` | all 12 layers on the FA2 path |
+| pretrained keys loaded | 153/178 total, **144 transformer** | V5 — the trunk loaded; the 25 unloaded are the perturbation encoder + decoder head, which train from scratch by design |
+| `n_test_cells_in_training` | **0** (61 992 cells → 51 171 train+val) | V6 — the documented leak is closed |
+| optimiser steps | **707**/epoch [636], `batch_size_effective == configured == 64` | V11 — not a zero-step run |
+| `best_epoch` / `best_val_loss` | 1 / 0.0548 [0.0540] | V10 — best-val selection ran |
+| ctrl pairing tiers | `{split_only: 2}`, `covariate_col: null` | correct: adamson16 has ONE cell type, so covariate matching auto-disables. Counts distinct `(cov, batch, splits)` **pools**, not cells — the two are the train and val pools |
+| epoch wall time | **529.9 s** [497.9] (+ ~4 min data prep) | 15 epochs ≈ 2.2 h, inside `train_timeout: 21600`. Size M1 from this, not from row counts. V26 added 4 550 train graphs (45 200 [40 650]) by making 11 more perturbations trainable |
+| `cell_graphs.pkl` | **4.66 GB** [3.75] (output dir 6.1 GB total) | R2 — vs the ~5.6 GB planning estimate. Predict did not need it. **V26 grew it ~24 %** (more genes per dense graph); re-check before replogle22/jiang24 |
+| peak RSS | **13.8 GB** [11.7] train, unchanged by predict | 64 GB is ample for adamson16; extrapolate before replogle22/jiang24, allowing for V26's larger panel |
+| predictions | `(18, 8086)` [(17, 7285)], finite frac 1.0, range `[-0.020, 4.38]` | log1p-ranged and finite |
+| delta tensor | `(1, 18, 8250)`, finite frac **0.980** [0.834] | exactly `8086/8250` — every test condition is now predicted, so the only NaNs left are genes outside the vocabulary |
+| gene resolution | 8 250 → **8 086** kept [7 285]: 7 285 by symbol + **801 by accession**, 164 unresolved [965], 1 collision | V26 — the accession route is live and recovered what the symbol join lost |
+| `gene_id_join` / `ensembl_column` | `ensembl_first` / `ensembl_id` | V26 — the column was auto-detected by value shape, not assumed from its name |
+| drop rule | `dropped_perturbations` **[]**, `dropped_test_conditions` **[]**, no all-NaN test KO | V9 + V26 — adamson16 now loses no perturbation at all; pre-V26 it lost 11, incl. the held-out `AARS` |
+
+**Two defects the smoke caught, both fixed:**
+
+1. `use_fast_transformer` was absent from `model.yaml` while the wrapper hard-requires it →
+   `KeyError` after 4 minutes of data prep. Added with provenance. A full diff of every
+   `hyperparams[...]` read against the recipe's keys now shows no other gap.
+2. `dropped_test_conditions` was computed at predict, logged, and **discarded** — predict
+   wrote no report. A test-only KO outside the vocab therefore became an all-NaN slice with
+   nothing machine-readable to explain it, and the train-side `dropped_perturbations`
+   structurally cannot name it (the V6 filter removes test cells before the drop scan).
+   Fixed by `_write_predict_report` → `scgpt_predict_report.json`.
+
+   The live case: **`AARS`** is held out as test on fold0 and absent from the checkpoint
+   vocabulary, so it is legitimately unpredictable — 11 dropped targets, matching the
+   78/89 survival measured during planning.
+
+### The drop rule was a symbol-join artifact — RESOLVED by V26
+
+The G1 smoke's 11 dropped targets were not scGPT's limitation but our symbol join's. Fixed
+by V26 (see §8): adamson16 goes from 7 285 to 8 086 genes and from 11 dropped targets to
+**none**. Datasets without an accession column (replogle22, jiang24, wessels23,
+xatlas_orion) are unchanged and still drop by symbol.
+
+---
+
+## 8. Gene identity: Ensembl-first resolution (V26)
+
+scGPT tokenises against a fixed 60 664-name vocabulary, so every gene must be matched to a
+vocabulary entry. Matching by **HGNC symbol** — what the atheus source did — is wrong,
+because symbols drift and accessions do not. `gene_info_scgpt.csv` carries `feature_id`
+(Ensembl) beside `feature_name` and is a clean bijection (60 664 unique on both axes).
+
+**Resolution order, per gene:** symbol identity -> Ensembl accession (if it yields a name no
+symbol match has claimed) -> `NaN`, dropped. **Symbol identity wins collisions**, which makes
+the change strictly ADDITIVE — the accession route may only add genes, never displace one the
+old join kept. `_ensure_symbol_scgpt` asserts both post-conditions: the surviving mapping is
+injective, and it is a superset of the symbol-only result.
+
+Measured on adamson16 (`ensembl_first` vs `symbol_only`, real data, both modes run):
+
+| mode | genes kept of 8 250 | by symbol | by accession | collisions | targets lost of 89 |
+|---|---|---|---|---|---|
+| `symbol_only` (pre-V26) | 7 285 | 7 285 | 0 | 0 | **11** |
+| `ensembl_first` (default) | **8 086** | 7 285 | 801 | 1 | **0** |
+
+The one collision is real: `RP11-343N15.1` (ENSG00000230806) resolves by accession to
+`SRGAP2-AS1`, which our own gene named `SRGAP2-AS1` (ENSG00000233501) already holds by
+symbol. It is dropped with a warning rather than emitting a duplicate token — unhandled,
+`gene_ids` would carry the same vocabulary id twice and `np.where(p == gene_names)[0][0]`
+would silently resolve to the first.
+
+### Three things that make the detection robust
+
+The accession column is found by the **shape of its values** (`^ENSG\d{11}`), never by name,
+because across our own datasets it is spelt three different ways and is not always complete:
+
+| spelling | datasets |
+|---|---|
+| `ensembl_id` | adamson16, frangieh21, mcfaline23, sunshine23 |
+| `ensemble_id` (misspelled) | norman19 |
+| `gene_id` | replogle20 |
+| **none at all** | **replogle22, jiang24, wessels23, xatlas_orion, ecoli_synthetic** |
+
+1. Detection is by value, so the misspelling and `gene_id` are picked up automatically.
+2. Resolution is **per gene**, so a partly-populated column still contributes what it has —
+   frangieh21's is only 77.5 % accessions.
+3. `ENSEMBL_COLUMN_MIN_FRACTION` is deliberately low (0.1), not a majority: the pattern is
+   specific enough that coincidence is not a real failure mode, every value is validated
+   against the bijection anyway, and a high floor would discard a real partial column.
+
+**This does NOT fix every dataset.** replogle22, jiang24, wessels23 and xatlas_orion carry no
+accessions and are resolved by symbol exactly as before. The per-run report records
+`ensembl_column: null` for them, so a symbol-only run is visible rather than looking identical
+to an accession-resolved one.
+
+### Where it is recorded per run
+
+`scgpt_training_report.json` (and so `fingerprint.json`) carries `gene_id_join`,
+`ensembl_column`, `n_genes_matched_by_symbol`, `n_genes_matched_by_ensembl`,
+`n_genes_unresolved` and `n_gene_id_collisions`.
+
+### Namespaces — why nothing needs translating back
+
+The vocabulary name exists in exactly one place and is read by exactly one consumer:
+
+| column | namespace | read by |
+|---|---|---|
+| `var_names` | **ours** | predictions axis, DE genes, the predict-time re-read check (`CONTRACT.md:141`) |
+| `var['gene_name']` | **ours** | `pert_data.gene_names` -> `get_pert_idx`, condition matching, prediction graphs |
+| `var['symbol_scgpt']` | **scGPT** | the tokenizer, and nothing else |
+
+So predictions, `obs['condition']` and the gene axis never leave our symbols, and comparability
+with every other predictor holds by construction — there is no inverse map to maintain and no
+egress translation that could be forgotten. The mapping is written into
+`perturb_processed.h5ad` at train and re-read at predict, so it is frozen into the trained
+artefact and predict cannot resolve differently than fine-tuning did.
+
+`extra_config.gene_id_join` selects the mode; `symbol_only` reproduces the pre-V26 join
+exactly. It lives in `model.yaml`, so it is hashed into `recipe_sha` and a change invalidates
+checkpoints rather than being served silently.
+
+---
+
+## 9. Shared implementations (why some code is NOT here)
+
+An infrastructure review across `docker/{gears,presage,scgpt}` removed the copies that let
+the three containers drift apart. What moved, and why it matters here:
+
+* **`_pert_flag_vector`** (module level, this file) is now the ONLY place the per-gene
+  perturbation flag row is built. Train and predict each had their own copy, and they
+  disagreed — that *is* V25. One definition is why it cannot recur. The callers hold
+  different shapes (`(k, n_genes)` at train, `(n_genes,)` at predict), so `n_genes` is passed
+  explicitly rather than derived inside.
+* **`_write_report`** replaced a train writer and a predict writer that shared six of eight
+  body lines; the mode-specific fields (`architecture`, `model_path`) are passed by the caller.
+* **`create_cell_graph_dataset_for_prediction` was DELETED.** It was unreachable — upstream
+  defines that name as a module-level function in `gears.utils` and `GEARS.predict` calls the
+  module-level one, so nothing dispatched to our method — and it implemented the **pre-V7
+  unmatched control draw**, the exact behaviour V7 exists to prevent. Dead code that would
+  have silently reintroduced cell-blindness if anyone had called it.
+* Host-side, `ContainerPredictor` now owns `_check_target_coverage` (the drop-rule floor,
+  shared with GEARS) and `_read_json_report` (shared with PRESAGE), and the control-label
+  predicate comes from `_container/leakage.py` rather than four inline copies — the host twin
+  of the V13 fix this file already applies with `CONTROL_LABELS`.

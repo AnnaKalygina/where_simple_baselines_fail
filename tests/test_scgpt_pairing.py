@@ -184,3 +184,52 @@ def test_control_labels_match_whole_strings_not_substrings(W):
     assert W._is_control_label("ctrl")
     assert W._is_control_label("control")
     assert not W._is_control_label("RctrlSEL")
+
+
+# ------------------------------------------------ V25/V27: the perturbation flag
+
+# The flag vector is the model's ONLY signal that a perturbation happened, and a
+# wrong one still yields finite, log1p-ranged output — nothing downstream catches
+# it. It used to be built twice (train and predict), and the two disagreed: that
+# was V25. These pin the single implementation against both call shapes.
+
+def test_pert_flag_marks_exactly_the_perturbed_genes(W):
+    f = W._pert_flag_vector(5, [2])
+    assert list(f) == [0, 0, 1, 0, 0]
+
+
+def test_pert_flag_handles_gene_index_zero(W):
+    """The V25 case: np.sign(0) == 0 silently unflagged the first gene."""
+    f = W._pert_flag_vector(4, [0])
+    assert list(f) == [1, 0, 0, 0]
+
+
+def test_pert_flag_marks_every_target_of_a_combo(W):
+    f = W._pert_flag_vector(4, [0, 3])
+    assert list(f) == [1, 0, 0, 1]
+
+
+def test_controls_get_an_all_zero_flag_row(W):
+    assert not W._pert_flag_vector(3, None).any()
+
+
+def test_index_beyond_the_panel_is_skipped_not_an_error(W):
+    """Some GEARS PertData versions index into a superset of the gene list."""
+    f = W._pert_flag_vector(3, [1, 99])
+    assert list(f) == [0, 1, 0]
+
+
+def test_the_not_found_sentinel_is_refused(W):
+    """V27: get_pert_idx returns [-1] when a gene is missing, and abs(-1) == 1 —
+    so the sentinel used to silently flag gene 1 as the perturbed gene."""
+    with pytest.raises(ValueError, match="sentinel"):
+        W._pert_flag_vector(5, [-1])
+
+
+def test_both_call_shapes_produce_the_same_row(W):
+    """train passes (k, n_genes) and derives len(X[0]); predict passes (n_genes,)
+    and derives len(X). The helper must see the same n_genes either way."""
+    stacked = np.zeros((3, 6))       # create_cell_graph's X
+    profile = np.zeros(6)            # create_cell_graph_for_prediction's X
+    assert list(W._pert_flag_vector(len(stacked[0]), [4])) == \
+           list(W._pert_flag_vector(len(profile), [4]))

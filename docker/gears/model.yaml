@@ -28,6 +28,10 @@ expected_artifacts:
   - model.pt                                              # trained weights
   - config.pkl                                            # GEARS model config (load_pretrained needs both)
   - processed_data/cellsimbench_gears/data_pyg/cell_graphs.pkl   # PyG graphs (~3.7 GB)
+  - gears_training_report.json                        # provenance the fingerprint hash cannot
+                                                      # show: split counts, and WHICH conditions
+                                                      # gene2go dropped. Required, so a run that
+                                                      # records nothing does not count as trained.
   - processed_data/cellsimbench_split_dict.pkl            # the custom split GEARS re-prepares at predict
 
 # Hyperparameters — the GEARS AUTHORS' recommended values (the vendored GEARS

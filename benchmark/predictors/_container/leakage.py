@@ -49,6 +49,27 @@ def _is_control(cond_series, control_labels):
     return exact | substr
 
 
+#: Public name for the mask above. The leakage gate calls `_is_control`; callers
+#: outside this module use this. Same function, not a copy — a second
+#: implementation is exactly how the four hand-spelled copies in
+#: container_predictor.py came to exist.
+control_mask = _is_control
+
+
+def is_control_label(cond, control_labels=DEFAULT_CONTROL_LABELS) -> bool:
+    """Scalar twin of :func:`control_mask` — is this ONE condition a control?
+
+    Must stay equivalent to the mask: ``control_mask(pd.Series(xs))`` and
+    ``[is_control_label(x) for x in xs]`` agree elementwise. That equivalence is
+    pinned in tests/test_container_infra_shared.py, because the host preflight's
+    B1/B2 checks use the mask while its coverage checks use this, and a drift
+    between them would make one gate disagree with another about what a control
+    is.
+    """
+    s = str(cond)
+    return s in tuple(control_labels) or "ctrl" in s.lower()
+
+
 def assert_leak_safe_columns(
     h5ad_path,
     split_name: str,

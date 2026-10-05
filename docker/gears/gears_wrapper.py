@@ -756,6 +756,11 @@ class GEARSWrapper:
     def __init__(self, config: Dict):
         self.config = config
         self._set_seed()                 # F1: make config['seed'] actually drive training
+        #: Per-run provenance, written out as gears_{training,predict}_report.json.
+        #: GEARS declares has_drop_rule = True and silently drops every condition
+        #: whose targets are outside gene2go; until this existed nothing recorded
+        #: WHICH, so a scored run could not say what it had omitted.
+        self._report: Dict = {}
         self.model = None
         self.pert_data = None
         self.gene2go = self._load_gene2go()
@@ -886,6 +891,10 @@ class GEARSWrapper:
         log.info(f"Saving model to {output_dir}")
         self.model.save_model(str(output_dir))
         self._save_metadata(output_dir)
+        self._report['epochs'] = int(epochs)
+        self._report['lr'] = float(lr)
+        self._report['weight_decay'] = float(weight_decay)
+        self._write_report(output_dir, 'gears_training_report.json')
         
         log.info("Training completed successfully")
         
@@ -955,6 +964,8 @@ class GEARSWrapper:
         output_path = self.config['output_path']
         log.info(f"Saving predictions to {output_path}")
         predictions_adata.write_h5ad(output_path)
+        self._write_report(Path(output_path).parent, 'gears_predict_report.json',
+                           model_path=self.config.get('model_path'))
         
         log.info("Prediction completed successfully")
         
@@ -980,7 +991,12 @@ class GEARSWrapper:
         is_unseen_pert = bool(split_name) and (
             '_s1_' in split_name or 'UnseenPert' in split_name
         )
+        # Recorded explicitly rather than left as an absent field: a reader of the
+        # report must be able to tell "the filter ran and found nothing" from
+        # "the filter never ran", and from "split_name was missing entirely".
+        self._report['split_filter_applied'] = not is_unseen_pert
         if is_unseen_pert:
+            self._report['split_filter_skipped_reason'] = 'UnseenPert regime'
             log.info(
                 f"Per-cell split filter SKIPPED for UnseenPert regime "
                 f"(split_name={split_name!r})"
@@ -993,7 +1009,14 @@ class GEARSWrapper:
                 f"Per-cell split filter on '{split_name}': {n_before} → "
                 f"{adata_gears.n_obs} cells (dropped held-out test cells)"
             )
+            self._report['n_cells_total'] = int(n_before)
+            self._report['n_cells_trainval'] = int(adata_gears.n_obs)
+            self._report['n_test_cells_in_training'] = int(
+                (adata_gears.obs[split_name].astype(str) == 'test').sum())
         else:
+            self._report['split_filter_applied'] = False
+            self._report['split_filter_skipped_reason'] = (
+                f"split_name={split_name!r} absent from obs")
             log.warning(
                 "No 'split_name' in config or column missing — skipping per-cell "
                 "split filter. This is unsafe for s2/s3/s4 when covariates are on."
@@ -1133,9 +1156,10 @@ class GEARSWrapper:
         }
         
         # Filter out genes not in gene2go
+        dropped_by_split: Dict[str, list] = {}
         for split in ['train', 'val', 'test']:
             original_count = len(split_dict[split])
-            filtered_conditions = []
+            filtered_conditions, dropped = [], []
             
             for cond in split_dict[split]:
                 if cond == 'ctrl':
@@ -1145,10 +1169,18 @@ class GEARSWrapper:
                     genes = self._parse_perturbation(cond)
                     if all(gene in self.pert_data.gene2go.keys() for gene in genes):
                         filtered_conditions.append(cond)
+                    else:
+                        dropped.append(str(cond))   # counted, not just absent
             
             split_dict[split] = filtered_conditions
+            dropped_by_split[split] = sorted(dropped)
             filtered_count = len(split_dict[split])
             log.info(f"{split} split: {filtered_count}/{original_count} conditions kept")
+            if dropped:
+                log.warning(f"{split} split: {len(dropped)} condition(s) dropped for "
+                            f"targets outside gene2go: {sorted(dropped)[:10]}")
+        self._report['dropped_conditions_by_split'] = dropped_by_split
+        self._report['n_dropped_conditions'] = sum(len(v) for v in dropped_by_split.values())
         
         # Save split dictionary to persistent location
         output_dir = Path(self.config['output_dir'])
@@ -1197,6 +1229,7 @@ class GEARSWrapper:
         
         # Convert conditions to GEARS format and parse into gene lists
         gears_conditions = []
+        dropped_test = []          # conditions gene2go cannot model — reported, not just logged
         for cond in test_conditions:
             if cond != 'control':  # Skip control condition
                 # Convert to GEARS format first
@@ -1213,8 +1246,16 @@ class GEARSWrapper:
                     gears_conditions.append(genes)
                     log.info(f"Adding condition for prediction: {cond} -> {genes}")
                 else:
+                    # Counted, not just warned: an unpredictable test condition
+                    # becomes an all-NaN row host-side, and a log line cannot
+                    # explain it to whoever reads the metrics.
+                    dropped_test.append(str(cond))
                     log.warning(f"Skipping condition {cond}: genes {genes} not found in gene2go")
         
+        self._report['dropped_test_conditions'] = sorted(dropped_test)
+        if dropped_test:
+            log.warning(f"{len(dropped_test)} test condition(s) not predictable "
+                        f"(targets outside gene2go): {sorted(dropped_test)[:10]}")
         log.info(f"Generating predictions for {len(gears_conditions)} valid conditions")
 
         if not gears_conditions:
@@ -1623,6 +1664,24 @@ class GEARSWrapper:
                 out[(c, p)] = matrix[i]
             return out
         return {str(c): matrix[i] for i, c in enumerate(conditions)}
+
+    def _write_report(self, output_dir: Path, filename: str, **extra):
+        """Write one JSON provenance report next to the run's artefacts.
+
+        The host lifts the training one into ``fingerprint.json`` via
+        ``GEARSContainer._train_report``. The predict one is NOT an expected
+        artifact — predict runs after the completeness check — but it is what
+        explains an all-NaN row to whoever reads the metrics.
+        """
+        report = dict(self._report)
+        report['seed'] = int(self.config.get('seed', 42))
+        report['split_name'] = self.config.get('split_name')
+        report['data_path'] = self.config.get('data_path')
+        report.update(extra)
+        path = output_dir / filename
+        with open(path, 'w') as f:
+            json.dump(report, f, indent=2, cls=PathEncoder, sort_keys=True)
+        log.info(f"Wrote {path} ({len(report)} fields)")
 
     def _save_metadata(self, output_dir: Path):
         """Save training metadata."""

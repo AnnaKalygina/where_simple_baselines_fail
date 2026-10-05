@@ -197,13 +197,16 @@ PY
     # the image self-describing. Checksums fail the BUILD, which is also how a
     # Google Drive rate-limit interstitial (an HTML page saved as best_model.pt)
     # gets caught instead of surfacing as a torch.load error hours later.
-    pip install --no-cache-dir gdown
+    # Pinned: gdown's CLI flags are not stable across majors (6.x dropped
+    # --remaining-ok, which an earlier draft of this file passed). Verified
+    # 6.1.0 downloads this folder correctly, flat, with matching md5s.
+    pip install --no-cache-dir "gdown==6.1.0"
     mkdir -p /opt/scgpt_pretrained
     # Drive rate-limits; retry a few times before giving up. A limited response is
     # an HTML interstitial saved as best_model.pt, which the md5 check below is what
     # actually catches — the retry just makes the common transient case self-heal.
     for attempt in 1 2 3; do
-        gdown --folder 1oWh_-ZRdhtoGQ2Fw24HP41FgLoomVo-y -O /opt/scgpt_pretrained --remaining-ok && break
+        gdown --folder 1oWh_-ZRdhtoGQ2Fw24HP41FgLoomVo-y -O /opt/scgpt_pretrained && break
         echo "gdown attempt $attempt failed; retrying in 30s"
         sleep 30
     done
@@ -244,9 +247,15 @@ PY
     # NOTICE. MIT still requires the copyright notice to travel with the code.
     # Globbed, because a hardcoded LICENSE filename failed the first PRESAGE build.
     git clone --depth 1 https://github.com/bowang-lab/scGPT.git /tmp/scgpt_repo || true
-    if ls /tmp/scgpt_repo/LICENSE* /tmp/scgpt_repo/COPYING* >/dev/null 2>&1; then
-        cp $(ls /tmp/scgpt_repo/LICENSE* /tmp/scgpt_repo/COPYING* | head -1) /LICENSE
-        echo "copied upstream licence to /LICENSE"
+    # `ls a* b*` returns NON-ZERO when either glob misses, so the obvious
+    # `if ls LICENSE* COPYING*` form reports "no licence found" even when LICENSE
+    # is right there — the guard meant to tolerate a MISSING licence swallowed a
+    # PRESENT one (observed in the 2026-08-27 build). Collect matches instead of
+    # testing ls's exit status.
+    lic="$(ls /tmp/scgpt_repo/LICENSE* /tmp/scgpt_repo/COPYING* 2>/dev/null | head -1)"
+    if [ -n "$lic" ]; then
+        cp "$lic" /LICENSE
+        echo "copied upstream licence from $lic to /LICENSE"
     else
         echo "WARNING: no upstream LICENSE found to copy"
     fi
