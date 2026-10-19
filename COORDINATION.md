@@ -94,6 +94,15 @@ Base seed `20261020`, passed to `numpy.random.default_rng` as a list:
 - **Files:** `T1-C_F3_flags.png`, `T1-C_F3_exclusive_counts.csv`.
 - **Commit:** 620e2b2
 
+### E4. Brief M3 per-gene table and figure T2-A
+- **Status:** done.
+- **Examples (brief rules, which differ slightly from the runbook's Figure 2 rules):** GATA1 (highest M: n 108, M 289, rho 0.93, pi 0.87, dBIC 46, mixture); PSMD7 (pi closest to 0.5 among dBIC > 10: n 373, pi 0.50, dBIC 106); KIF11 (largest n among rho < 0.5: n 974, rho 0.16, pi 0.07, dBIC 36, `edge`).
+- **M3 columns:** per G0 gene and set (controls, the three perturbations): A_prime and B_prime (1e6 scale), mu_1e4 and var_1e4 (u), delta_C, logdiff, varterm (formulas as in the brief), is_target.
+- **Files:** `M3_per_gene_k562_essential.csv.gz` (per-gene summary, 4 x 8,548 rows), `T2-A_response_shapes.png`, `M3_T2A_examples.json`.
+
+### E5. Brief F6 (direction and scale errors, PRESAGE / Ridge / baseline, replogle22 UnseenPert)
+- **Status:** skipped: the inputs do not exist. No replogle22 UnseenPert predictions in the current pipeline format for PRESAGE, Ridge or the regime baseline anywhere on the cluster (`models/replogle22/` holds only `PRESAGE-ct/UnseenBoth/fold0`). The only UnseenPert predictions are the old PRESAGE/GEARS/scGPT drops in `models/atheus_csb/*_replogle22_s1/` (trust `legacy_caution`, may predate the leakage fix, K562 and RPE1 mixed). Producing F6 needs a benchmark run of Ridge, Mean + Target Scaling and PRESAGE-ct on replogle22 UnseenPert first.
+
 ## Blockers
 
 - **Vault pull request.** The cluster has no `gh` CLI and no GitHub token (SSH push works). The inbox branch `inbox/where_simple_baselines_fail/talk-figures` is pushed, but the pull request and `gh pr merge --auto --squash` need Anna (or a token).
