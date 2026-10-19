@@ -81,6 +81,7 @@ Base seed `20261020`, passed to `numpy.random.default_rng` as a list:
 - **Headline:** 342 empirical-null mixtures vs 348 runbook mixtures, 317 in both. Figure 1 groups (n ≥ 150): reliable 61.0% (runbook 60.8%), unreliable 6.1% (7.2%). The skew warning in R1 does not change the Figure 1 conclusion.
 - **Not done:** the false-positive rate of this variant on the M2 nulls (their scores were not saved).
 - **Files:** `mixture_sensitivity_k562_essential.csv`, `mixture_sensitivity_fig1_groups.csv`; code `mixture_sensitivity.py`.
+- **Commit:** bcdd9a3
 
 ### E2. Brief F1 and figure T1-B
 - **Status:** done.
@@ -99,6 +100,7 @@ Base seed `20261020`, passed to `numpy.random.default_rng` as a list:
 - **Examples (brief rules, which differ slightly from the runbook's Figure 2 rules):** GATA1 (highest M: n 108, M 289, rho 0.93, pi 0.87, dBIC 46, mixture); PSMD7 (pi closest to 0.5 among dBIC > 10: n 373, pi 0.50, dBIC 106); KIF11 (largest n among rho < 0.5: n 974, rho 0.16, pi 0.07, dBIC 36, `edge`).
 - **M3 columns:** per G0 gene and set (controls, the three perturbations): A_prime and B_prime (1e6 scale), mu_1e4 and var_1e4 (u), delta_C, logdiff, varterm (formulas as in the brief), is_target.
 - **Files:** `M3_per_gene_k562_essential.csv.gz` (per-gene summary, 4 x 8,548 rows), `T2-A_response_shapes.png`, `M3_T2A_examples.json`.
+- **Commit:** 960f176
 
 ### E5. Brief F6 (direction and scale errors, PRESAGE / Ridge / baseline, replogle22 UnseenPert)
 - **Status:** skipped: the inputs do not exist. No replogle22 UnseenPert predictions in the current pipeline format for PRESAGE, Ridge or the regime baseline anywhere on the cluster (`models/replogle22/` holds only `PRESAGE-ct/UnseenBoth/fold0`). The only UnseenPert predictions are the old PRESAGE/GEARS/scGPT drops in `models/atheus_csb/*_replogle22_s1/` (trust `legacy_caution`, may predate the leakage fix, K562 and RPE1 mixed). Producing F6 needs a benchmark run of Ridge, Mean + Target Scaling and PRESAGE-ct on replogle22 UnseenPert first.
@@ -111,6 +113,7 @@ Base seed `20261020`, passed to `numpy.random.default_rng` as a list:
 - **F9:** R = mean(L)·mean(1/L): perturbations 5/50/95% 1.094, 1.139, 1.239; controls 1.125. Depth CV median 0.354 (controls 0.334). NB-weighted pseudobulk (space A with w_ig = L_i/(1 + phi_g theta_g L_i)): rho ≥ 0.5 34.2%. Decision: phi_g and theta_g = phi-hat and mu/1e4 of all controls (G0), phi clipped at 0 (399 genes with phi ≤ 0 get Poisson weights).
 - **T1-A (Spearman of all descriptors, all 2,021, full n, ordered by |corr with M|):** with M: tau2 1.00, rho 0.95, mu1 0.87, phi 0.77, D 0.48, median depth −0.42, pi_raw 0.42, dBIC 0.33, breadth −0.25, mito_AmB 0.04, mito frac 0.03, n 0.02. The S0-a side bar exists only for M, tau2, pi, D and rho; **S0-a/b were not computed for breadth_pr, phi, mito_AmB, depth columns** (deviation from "S0 checks for every descriptor").
 - **Files:** `M1_full_k562_essential.csv`, `M1_extras_k562_essential.csv`, `F2_F7_F9_headline.json`, `T1-A_descriptor_heatmap.png`, `T1-A_spearman_all_descriptors.csv`, `T2-B_reliability_spaces.png`, `extras_setup_k562_essential.json`; code `run_extras.py`, `post_extras.py`.
+- **Commit:** 9e6129c
 
 ### E7. F10, essential vs genome-wide K562
 - **Status:** done.
@@ -122,6 +125,7 @@ Base seed `20261020`, passed to `numpy.random.default_rng` as a list:
 - **(d) Shared perturbations (2,003):** their own magnitude is the same in both screens (median M 5.96 vs 5.86, Spearman 0.83). Distance to the leave-one-out screen mean: median 4.16 (essential) vs 3.84 (genome-wide), larger in genome-wide for only 32%. Baseline Saturation (see definition below): median 0.71 vs 0.78 (n = 1,869 with both defined), lower in genome-wide for only 30%; Spearman between screens 0.34. **The expectation "the same perturbation sits farther from the genome-wide mean and looks harder" is not supported.**
 - **Baseline Saturation definition used (decision, the brief gives the general formula only):** Pearson across shared genes minus target, b = leave-one-out unweighted mean effect of the screen, truth = half-B effect, positive control = half-A effect, m(0, y) = 0: BS = clip(corr(b, y_B) / corr(y_A, y_B), 0, 1), empty when corr(y_A, y_B) ≤ 0. **No Target Scaling** (the paper's UnseenPert baseline is Mean + Target Scaling). Pearson ignores scale, so it cannot react to the shorter genome-wide mean by construction; the distance column is the scale-aware view.
 - **Files:** `F10_headline.json`, `F10_shared_perturbations.csv`, `F10_per_perturbation_essential.csv`, `F10_per_perturbation_gwps.csv`, `F10_screen_mean.png`; code `f10_stream.py`, `f10_analyze.py`.
+- **Commit:** 9e6129c
 
 ### E8. F8, Norman 2019 combinations
 - **Status:** done.
@@ -129,6 +133,7 @@ Base seed `20261020`, passed to `numpy.random.default_rng` as a list:
 - **Errors (UnseenCombo, `_panel_miller_align`, folds 0 and 1, pipeline truth = first-half pseudobulk minus control, both targets excluded):** models run: PRESAGE, GEARS, scGPT, Additive (also present but not used: Ridge, LinearAdditive, GlobalEpistasis, LatentAdditive and others). Identity D + S = squared error holds on every row (max relative difference 1.6e-14). Median direction share D / (D + S): PRESAGE 0.88, GEARS 0.91, scGPT 0.95, Additive 0.83. Spearman of NA with scale error: PRESAGE 0.59, GEARS 0.48, scGPT 0.09, Additive 0.71; with direction error: 0.00, −0.15, −0.22, −0.06.
 - **Deviation:** scGPT predictions are NaN on 111 genes for most pairs (outside its vocabulary), and fully NaN for 6 rows (3 per fold); GEARS fully NaN for 1 row. Errors use the genes with a finite prediction (`n_genes`, `n_genes_nan_prediction` per row); fully NaN rows are empty.
 - **Files:** `F8_non_additivity_norman19.csv`, `F8_direction_scale_errors_norman19.csv`, `F8_errors_with_NA_norman19.csv`, `F8_headline.json`; code `f8_combos.py`.
+- **Commit:** 9e6129c
 
 ### Not done
 - F4 (GEM-group halves), F5, T1 (RPE1 transfer): not in tonight's scope.
