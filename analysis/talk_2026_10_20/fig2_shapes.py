@@ -92,7 +92,7 @@ def main():
         ax.set_xlabel("response score\n(log1p units)", fontsize=12)
         if k == 0:
             ax.set_ylabel("residual PC1 (log1p units)", fontsize=12)
-        ax.tick_params(labelsize=10)
+        ax.tick_params(labelsize=12)
         ax.spines[["top", "right"]].set_visible(False)
         record.append(dict(panel=k + 1, kind=kind, perturbation=name, rule=rule, n_cells=int(r.n_cells),
                            rho=float(r.rho), M=float(r.M), pi=None if pd.isna(r.pi) else float(r.pi),

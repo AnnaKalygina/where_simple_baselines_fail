@@ -161,8 +161,8 @@ def plot_fig3(s0t, sm):
     for i in range(len(names)):
         for j in range(len(names)):
             v = sm.values[i, j]
-            ax.text(j, i, "" if not np.isfinite(v) else f"{v:.2f}".replace("0.", ".").replace("-.", "−."),
-                    ha="center", va="center", fontsize=9 if len(names) > 5 else 12, color=NAVY)
+            ax.text(j, i, "" if not np.isfinite(v) else f"{v:.1f}".replace("0.", ".").replace("-.", "−."),
+                    ha="center", va="center", fontsize=12, color=NAVY)
     lab = [LABELS[n] for n in names]
     ax.set_xticks(range(len(names)), lab, rotation=90)
     ax.set_yticks(range(len(names)), lab)
@@ -172,14 +172,14 @@ def plot_fig3(s0t, sm):
     t = s0t.set_index("metric").loc[METRICS]
     y = np.arange(len(METRICS))
     h = 0.26
-    bx.barh(y - h, t.S0b_corr_n_before.abs(), h, color=GRAY, label="|corr(d, n)| full")
-    bx.barh(y, t.S0b_corr_n_after.abs(), h, color=RED, label="|corr(d, n)| at 100 cells")
-    bx.barh(y + h, t.S0a_spearman_brown, h, color=TURQ, label="stability (S0-a)")
+    bx.barh(y - h, t.S0b_corr_n_before.abs(), h, color=GRAY, label="|corr with n|, all cells")
+    bx.barh(y, t.S0b_corr_n_after.abs(), h, color=RED, label="|corr with n|, 100 cells")
+    bx.barh(y + h, t.S0a_spearman_brown, h, color=TURQ, label="split-half stability")
     bx.set_yticks(y, [LABELS[m] for m in METRICS])
     bx.invert_yaxis()
     bx.set_xlim(0, 1)
     bx.set_xlabel("Spearman (unitless)")
-    bx.legend(frameon=False, fontsize=9, loc="lower right", bbox_to_anchor=(1.0, 1.0))
+    bx.legend(frameon=False, fontsize=12, loc="lower right", bbox_to_anchor=(1.05, 1.0), handlelength=1)
     bx.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
     fig.savefig(OUT / "fig3_metrics.png", dpi=300)

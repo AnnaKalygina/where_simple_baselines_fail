@@ -1,0 +1,3 @@
+group,n,pct_mixture,pct_widened,pct_no_effect,pct_mixture_escaper,pct_mixture_not_escaper,n_mixture_escaper_eligible,tau2_median,n_tau2_defined
+reliable,400,60.75000000000001,79.5,0.0,6.5,43.25,199,0.0250629022344504,400
+unreliable,362,7.18232044198895,14.917127071823206,54.14364640883977,1.6574585635359116,3.867403314917127,20,0.0009517761997472,351
