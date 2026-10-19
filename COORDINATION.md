@@ -40,7 +40,7 @@ Base seed `20261020`, passed to `numpy.random.default_rng` as a list:
 - **Headline:** 2,021 perturbations with n ≥ 20 (36 excluded, listed in `setup_k562_essential.json`), 10,691 controls, |G0| = 8,548 genes. 39.4% have rho ≥ 0.5. Shapes: 924 shift, 690 none, 348 mixture, 59 edge. tau2 and tau2_direct agree (Spearman 0.9996, n = 1,978). Consistency "mean = pi d" holds for mixtures (Spearman of mean_B(s) − mu0 vs pi (mu1 − mu0): 0.999).
 - **Files:** `results/talk_2026-10-20/M1_k562_essential.csv` (one row per perturbation); per-cell half-B and K3 scores on the cluster only, `/cluster/work/boeva/akalygina/wsb13_cache/scores_halfB_K3_k562_essential.parquet`.
 - **Deviations:** decisions 1 to 8 above.
-- **Warning, null-score skew (runbook 3.4 "shape of the null scores"):** the K3 control scores are often far from normal: median |skew| 0.88, 67% of perturbations above 0.5. Skew grows with magnitude (Spearman 0.65 with M) and is largest exactly where mixtures are called (median skew: mixture 1.96, shift 1.07, none 0.09). Among n ≥ 150, the mixture rate is 15% for |skew| < 0.5 and 53% for |skew| ≥ 1. The response direction appears to run along an axis on which controls already have a right tail, and a normal component 0 cannot fit that tail, so **a large share of the mixture calls may be misfit of the normal null rather than two subpopulations**. Not changed; a sensitivity check is listed under extras.
+- **Warning, null-score skew (runbook 3.4 "shape of the null scores"):** the K3 control scores are often far from normal: median |skew| 0.88, 67% of perturbations above 0.5. Skew grows with magnitude (Spearman 0.65 with M) and is largest exactly where mixtures are called (median skew: mixture 1.96, shift 1.07, none 0.09). Among n ≥ 150, the mixture rate is 15% for |skew| < 0.5 and 53% for |skew| ≥ 1. The response direction appears to run along an axis on which controls already have a right tail, and a normal component 0 cannot fit that tail, so **a large share of the mixture calls may be misfit of the normal null rather than two subpopulations**. Not changed. **Sensitivity check (E1) answers this: the calls are robust**, 317 of 348 survive an empirical null.
 - **Commit:** 35921fa
 
 ### R2. M2 null (50 control pseudo-perturbations, n = 123 = median n_p)
@@ -52,7 +52,7 @@ Base seed `20261020`, passed to `numpy.random.default_rng` as a list:
 ### R3. Figure 1, reliability filter vs response shape (n ≥ 150)
 - **Status:** done. **The figure does not support the expected claim.**
 - **Headline:** reliable (rho ≥ 0.5) n = 400 vs unreliable n = 362: mixture 60.8% vs 7.2%; widened 79.5% vs 14.9%; no detectable effect 0% vs 54.1%; mixture with escapers (kd_non > 0.8) 6.5% vs 1.7%. Median tau2 0.025 vs 0.00095. The unreliable group is mostly "no effect", not heterogeneous.
-- **Caveats for reading it:** (i) the mixture and widening tests gain power with effect size, so the comparison is not power-matched; (ii) the mixture rate is inflated where control scores are skewed (R1 warning); (iii) escaper diagnostic eligible for 199 of 243 reliable mixtures and 20 of 26 unreliable mixtures.
+- **Caveats for reading it:** (i) the mixture and widening tests gain power with effect size, so the comparison is not power-matched; (ii) control-score skew does not drive the split: with an empirical null (E1) it is 61.0% vs 6.1%; (iii) escaper diagnostic eligible for 199 of 243 reliable mixtures and 20 of 26 unreliable mixtures.
 - **Brief F3 overlap (unreliable, n ≥ 150, n = 362):** (a) M interval contains 0: 196; (b) D > D_null95: 54; (c) dBIC > 10 and 0.1 < pi_raw < 0.9 (brief wording, no |d'| rule): 29. a∧b 13, a∧c 4, b∧c 10, a∧b∧c 0, none of the three 110. Files `F3_flags_overlap.csv`, `F3_flags_per_perturbation.csv`.
 - **Files:** `fig1_filtering.png`, `fig1_filtering_table.csv`.
 - **Commit:** 35921fa
@@ -72,6 +72,27 @@ Base seed `20261020`, passed to `numpy.random.default_rng` as a list:
 - **Visible caveat:** in all three panels the controls themselves have a long tail along the response direction (the skew in R1).
 - **Files:** `fig2_shapes.png`, `fig2_examples.json`.
 - **Commit:** 0a413bc
+
+## Extras (after the runbook, in the brief's tier order)
+
+### E1. Mixture sensitivity to the normal null (not in the brief; checks the key claim)
+- **Status:** done.
+- **Method:** on the saved half-B and K3 scores, component 0 = Gaussian kernel density of the K3 scores (scipy `gaussian_kde`, Scott bandwidth), fixed; component 1 normal, free; EM with 10 starts (seed `[20261020, 400, i]`). A call needs pi in (0.1, 0.9), |d'| ≥ 1, dBIC > 10 against a single free normal **and** dBIC > 10 against the K3 density shifted by a free constant ("all cells shift, keeping the control shape").
+- **Headline:** 342 empirical-null mixtures vs 348 runbook mixtures, 317 in both. Figure 1 groups (n ≥ 150): reliable 61.0% (runbook 60.8%), unreliable 6.1% (7.2%). The skew warning in R1 does not change the Figure 1 conclusion.
+- **Not done:** the false-positive rate of this variant on the M2 nulls (their scores were not saved).
+- **Files:** `mixture_sensitivity_k562_essential.csv`, `mixture_sensitivity_fig1_groups.csv`; code `mixture_sensitivity.py`.
+
+### E2. Brief F1 and figure T1-B
+- **Status:** done.
+- **Headline:** fraction with rho ≥ 0.5 by n bin: <50 19.6% (n 189), 50–99 33.8% (533), 100–149 33.3% (537), 150–249 40.9% (523), 250–499 76.5% (213), ≥500 88.5% (26). Median tau2: 0.0093, 0.0079, 0.0038, 0.0038, 0.0213, 0.0281. tau2 is not constant across bins: perturbations with more cells also have larger tau2 in this screen.
+- **Files:** `F1_reliability_by_cell_bin.csv`, `T1-B_reliability_by_cell_bin.png`.
+- **Commit:** 620e2b2
+
+### E3. Brief F3 and figure T1-C
+- **Status:** done (numbers in R3, checked twice: computed in `analyze.py` and again as exclusive categories in `brief_tier1.py`, both sum to 362).
+- **Headline (exclusive):** no effect only 179, widened only 31, mixture only 15, no effect + widened 13, no effect + mixture 4, widened + mixture 10, all three 0, none 110.
+- **Files:** `T1-C_F3_flags.png`, `T1-C_F3_exclusive_counts.csv`.
+- **Commit:** 620e2b2
 
 ## Blockers
 
