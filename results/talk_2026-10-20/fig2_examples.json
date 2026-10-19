@@ -1,0 +1,53 @@
+[
+ {
+  "panel": 1,
+  "kind": "clean shift",
+  "perturbation": "INTS8",
+  "rule": "largest M among rho >= 0.5 with dBIC < 2",
+  "n_cells": 323,
+  "rho": 0.9631303408832784,
+  "M": 119.2166824707742,
+  "pi": null,
+  "pi_raw": 0.9034052565700056,
+  "dBIC": 0.1662067054276121,
+  "dprime": 5.258245005034205,
+  "D": 0.9315142353626144,
+  "D_null95": 0.4531137073238575,
+  "kd_non": null,
+  "shape": "shift"
+ },
+ {
+  "panel": 2,
+  "kind": "mixture",
+  "perturbation": "PSMD7",
+  "rule": "pi closest to 0.5 among dBIC > 10, |d'| >= 1, n >= 150, not escapers",
+  "n_cells": 373,
+  "rho": 0.9389192923373004,
+  "M": 53.74537173666385,
+  "pi": 0.5016227929944851,
+  "pi_raw": 0.5016227929944851,
+  "dBIC": 106.4020923024807,
+  "dprime": 5.830758676068675,
+  "D": 1.0025962068703005,
+  "D_null95": 0.4267929301347458,
+  "kd_non": 0.674177348613739,
+  "shape": "mixture"
+ },
+ {
+  "panel": 3,
+  "kind": "unreliable, many cells",
+  "perturbation": "KIF11",
+  "rule": "largest n among rho < 0.5 flagged mixture or widened",
+  "n_cells": 974,
+  "rho": 0.1612533508586698,
+  "M": 0.2106167194458712,
+  "pi": 0.0744632874704577,
+  "pi_raw": 0.0744632874704577,
+  "dBIC": 36.19758115017544,
+  "dprime": 2.4776907826517585,
+  "D": 0.2432687948898904,
+  "D_null95": 0.2361066427058312,
+  "kd_non": 0.6197583675384521,
+  "shape": "edge"
+ }
+]

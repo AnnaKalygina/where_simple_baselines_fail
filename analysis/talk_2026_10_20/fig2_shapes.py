@@ -70,7 +70,7 @@ def main():
     picks = choose(m1)
     rm.setup()
     fig = plt.figure(figsize=(6, 4.5))
-    gs = fig.add_gridspec(2, 3, height_ratios=[1, 3], hspace=0.05, wspace=0.35)
+    gs = fig.add_gridspec(2, 3, height_ratios=[1, 3], hspace=0.05, wspace=0.4, left=0.13, right=0.98, bottom=0.19, top=0.93)
     record = []
     for k, (kind, name, rule) in enumerate(picks):
         r = m1.set_index("perturbation").loc[name]
@@ -99,7 +99,7 @@ def main():
                            pi_raw=float(r.pi_raw), dBIC=float(r.dBIC), dprime=float(r.dprime),
                            D=float(r.D), D_null95=float(r.D_null95), kd_non=None if pd.isna(r.kd_non) else float(r.kd_non),
                            shape=r["shape"]))
-    fig.savefig(OUT / "fig2_shapes.png", dpi=300, bbox_inches="tight", pad_inches=0.1)
+    fig.savefig(OUT / "fig2_shapes.png", dpi=300)
     plt.close(fig)
     (OUT / "fig2_examples.json").write_text(json.dumps(record, indent=1))
     print(json.dumps(record, indent=1))
