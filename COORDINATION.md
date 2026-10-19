@@ -71,6 +71,7 @@ Base seed `20261020`, passed to `numpy.random.default_rng` as a list:
 - **Construction:** x = s_i on split 0 (direction from half A), half-B cells and K3 controls; y = PC1 of half-B residuals x_i − mean(K1) − s_i w over G, K3 projected. Seeds reproduce split 0 of the M1 run exactly.
 - **Visible caveat:** in all three panels the controls themselves have a long tail along the response direction (the skew in R1).
 - **Files:** `fig2_shapes.png`, `fig2_examples.json`.
+- **Commit:** 0a413bc
 
 ## Blockers
 
