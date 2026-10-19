@@ -1,0 +1,50 @@
+{
+ "n_shared_genes": 8186,
+ "essential": {
+  "n_cells": 310385,
+  "n_controls": 10691,
+  "n_perts": 2021,
+  "norm_mean_effect": 1.4709235860621004,
+  "norm_mean_effect_cell_weighted": 1.691581953009351,
+  "M_quantiles": {
+   "p10": 0.307,
+   "p25": 1.175,
+   "p50": 6.015,
+   "p75": 23.279,
+   "p90": 50.176
+  },
+  "threshold_max_null_M": 0.7958784697256782,
+  "null_M_p95": 0.41159683349691145,
+  "n_null": 50,
+  "null_size": 123,
+  "frac_M_above_threshold": 0.7971301335972291
+ },
+ "genome-wide": {
+  "n_cells": 1989578,
+  "n_controls": 75328,
+  "n_perts": 9787,
+  "norm_mean_effect": 0.45906144862300735,
+  "norm_mean_effect_cell_weighted": 0.32946390383847474,
+  "M_quantiles": {
+   "p10": 0.02,
+   "p25": 0.193,
+   "p50": 0.615,
+   "p75": 2.669,
+   "p90": 10.862
+  },
+  "threshold_max_null_M": 0.4384518841473569,
+  "null_M_p95": 0.2678714044561144,
+  "n_null": 50,
+  "null_size": 179,
+  "frac_M_above_threshold": 0.5779094717482375
+ },
+ "cosine_mean_effects": 0.8824818423212225,
+ "n_shared_perts": 2003,
+ "shared_median_dist_ess": 4.162948912913176,
+ "shared_median_dist_gw": 3.844364349602889,
+ "shared_frac_dist_gw_gt_ess": 0.3235147279081378,
+ "shared_BS_n": 1869,
+ "shared_median_BS_ess": 0.7076279554312833,
+ "shared_median_BS_gw": 0.7839028971750441,
+ "shared_frac_BS_gw_lt_ess": 0.29641519529159976
+}

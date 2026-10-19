@@ -1,6 +1,6 @@
 # wsb-13: talk figures 20.10
 
-**Ready for slides:** Figure 1 (filtering, claim NOT supported, see R3) and Figure 3 (metrics) ready; Figure 2 (shapes) ready. All three in the vault inbox.
+**Ready for slides:** Figure 1 (filtering, claim NOT supported, see R3) and Figure 3 (metrics) ready; Figure 2 (shapes) ready. All three in the vault inbox. Extras: T1-A, T1-B, T1-C, T2-A, T2-B, F10 figure and tables for M3, F2, F7, F8, F9; F6 impossible (no predictions).
 
 Scope (agreed with Anna 20.10, 00:30): the runbook `methodology_talk_2026-10-20.md` (four intrinsic metrics, three figures) first, then the brief's extras in tier order if time remains.
 
@@ -102,6 +102,37 @@ Base seed `20261020`, passed to `numpy.random.default_rng` as a list:
 
 ### E5. Brief F6 (direction and scale errors, PRESAGE / Ridge / baseline, replogle22 UnseenPert)
 - **Status:** skipped: the inputs do not exist. No replogle22 UnseenPert predictions in the current pipeline format for PRESAGE, Ridge or the regime baseline anywhere on the cluster (`models/replogle22/` holds only `PRESAGE-ct/UnseenBoth/fold0`). The only UnseenPert predictions are the old PRESAGE/GEARS/scGPT drops in `models/atheus_csb/*_replogle22_s1/` (trust `legacy_caution`, may predate the leakage fix, K562 and RPE1 mixed). Producing F6 needs a benchmark run of Ridge, Mean + Target Scaling and PRESAGE-ct on replogle22 UnseenPert first.
+
+### E6. Remaining M1 columns, F2, F7, F9 and figures T1-A, T2-B
+- **Status:** done. Space-C rho from this pass reproduces M1 rho exactly (max abs difference 4e-16), so the splits are identical.
+- **New columns** (`M1_full_k562_essential.csv` = M1 + extras): `breadth_pr` (median 696), `phi` and `phi_loo` (median 0.048 and 0.047; cos² to the cell-weighted mean effect of the 796 perturbations with rho ≥ 0.5, over G0 minus target), `mito_AmB` (5/50/95%: −1953, −4.1, 2320 on the 1e6 scale), `mito_frac_median` (controls 0.107), `log2_depth_ratio`, `depth_R`, `depth_cv`.
+- **F2 (gene panel):** rho ≥ 0.5 on G0 39.4%, top-2,000 HVG 51.6%, top-8,192 HVG 39.4%. HVG from scanpy `highly_variable_genes` (default `seurat` flavor) on normalize_total(1e4) + log1p of all 310,385 cells; panels are HVG ∩ G0 (11 of 2,000 and 12 of 8,192 HVG fall outside G0 and are dropped). File `F2_panels.csv`.
+- **F7 (spaces):** rho ≥ 0.5 in C 39.4%, A 37.3%, B 35.7%; Spearman of rho A vs C 0.993 (per-perturbation values in `F7_F9_spaces_weights.csv`).
+- **F9:** R = mean(L)·mean(1/L): perturbations 5/50/95% 1.094, 1.139, 1.239; controls 1.125. Depth CV median 0.354 (controls 0.334). NB-weighted pseudobulk (space A with w_ig = L_i/(1 + phi_g theta_g L_i)): rho ≥ 0.5 34.2%. Decision: phi_g and theta_g = phi-hat and mu/1e4 of all controls (G0), phi clipped at 0 (399 genes with phi ≤ 0 get Poisson weights).
+- **T1-A (Spearman of all descriptors, all 2,021, full n, ordered by |corr with M|):** with M: tau2 1.00, rho 0.95, mu1 0.87, phi 0.77, D 0.48, median depth −0.42, pi_raw 0.42, dBIC 0.33, breadth −0.25, mito_AmB 0.04, mito frac 0.03, n 0.02. The S0-a side bar exists only for M, tau2, pi, D and rho; **S0-a/b were not computed for breadth_pr, phi, mito_AmB, depth columns** (deviation from "S0 checks for every descriptor").
+- **Files:** `M1_full_k562_essential.csv`, `M1_extras_k562_essential.csv`, `F2_F7_F9_headline.json`, `T1-A_descriptor_heatmap.png`, `T1-A_spearman_all_descriptors.csv`, `T2-B_reliability_spaces.png`, `extras_setup_k562_essential.json`; code `run_extras.py`, `post_extras.py`.
+
+### E7. F10, essential vs genome-wide K562
+- **Status:** done.
+- **Data:** Figshare raw single-cell files for both screens (same matrix as Zenodo for essential), all cells, each against its own non-targeting controls (10,691 and 75,328). Shared genes: G0 of both screens, 8,186. Perturbations with n ≥ 20: 2,021 and 9,787; 2,003 shared.
+- **Design (simplified from M1 for a 2-million-cell file):** one random split per perturbation (halves) and one control-thirds split, seed `[20261020, 500, 1 or 2]`; magnitude as M1 (target excluded); 50 disjoint control pseudo-perturbations of the median size (123 and 179) against the remaining controls give the threshold.
+- **(a) Norm of the mean effect** (unweighted mean over perturbations): essential 1.47, genome-wide 0.46 (cell-weighted 1.69 vs 0.33). The genome-wide mean is 3.2 times shorter.
+- **(b) Magnitude:** median M 6.0 vs 0.62; threshold = largest null M (0.80 vs 0.44): 79.7% vs 57.8% of perturbations above it.
+- **(c) Cosine between the two means:** 0.88.
+- **(d) Shared perturbations (2,003):** their own magnitude is the same in both screens (median M 5.96 vs 5.86, Spearman 0.83). Distance to the leave-one-out screen mean: median 4.16 (essential) vs 3.84 (genome-wide), larger in genome-wide for only 32%. Baseline Saturation (see definition below): median 0.71 vs 0.78 (n = 1,869 with both defined), lower in genome-wide for only 30%; Spearman between screens 0.34. **The expectation "the same perturbation sits farther from the genome-wide mean and looks harder" is not supported.**
+- **Baseline Saturation definition used (decision, the brief gives the general formula only):** Pearson across shared genes minus target, b = leave-one-out unweighted mean effect of the screen, truth = half-B effect, positive control = half-A effect, m(0, y) = 0: BS = clip(corr(b, y_B) / corr(y_A, y_B), 0, 1), empty when corr(y_A, y_B) ≤ 0. **No Target Scaling** (the paper's UnseenPert baseline is Mean + Target Scaling). Pearson ignores scale, so it cannot react to the shorter genome-wide mean by construction; the distance column is the scale-aware view.
+- **Files:** `F10_headline.json`, `F10_shared_perturbations.csv`, `F10_per_perturbation_essential.csv`, `F10_per_perturbation_gwps.csv`, `F10_screen_mean.png`; code `f10_stream.py`, `f10_analyze.py`.
+
+### E8. F8, Norman 2019 combinations
+- **Status:** done.
+- **NA:** 131 pairs with both singles measured (111,445 cells, 11,855 controls, |G0| = 9,616 on the downloaded file, all cells). NA quantiles 10/25/50/75/90%: 0.05, 0.07, 0.12, 0.30, 0.54.
+- **Errors (UnseenCombo, `_panel_miller_align`, folds 0 and 1, pipeline truth = first-half pseudobulk minus control, both targets excluded):** models run: PRESAGE, GEARS, scGPT, Additive (also present but not used: Ridge, LinearAdditive, GlobalEpistasis, LatentAdditive and others). Identity D + S = squared error holds on every row (max relative difference 1.6e-14). Median direction share D / (D + S): PRESAGE 0.88, GEARS 0.91, scGPT 0.95, Additive 0.83. Spearman of NA with scale error: PRESAGE 0.59, GEARS 0.48, scGPT 0.09, Additive 0.71; with direction error: 0.00, −0.15, −0.22, −0.06.
+- **Deviation:** scGPT predictions are NaN on 111 genes for most pairs (outside its vocabulary), and fully NaN for 6 rows (3 per fold); GEARS fully NaN for 1 row. Errors use the genes with a finite prediction (`n_genes`, `n_genes_nan_prediction` per row); fully NaN rows are empty.
+- **Files:** `F8_non_additivity_norman19.csv`, `F8_direction_scale_errors_norman19.csv`, `F8_errors_with_NA_norman19.csv`, `F8_headline.json`; code `f8_combos.py`.
+
+### Not done
+- F4 (GEM-group halves), F5, T1 (RPE1 transfer): not in tonight's scope.
+- Optional UMAP for Figure 2.
 
 ## Blockers
 

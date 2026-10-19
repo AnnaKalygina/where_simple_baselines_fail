@@ -1,0 +1,11 @@
+{
+ "hvg2000_outside_G0":11.0,
+ "hvg8192_outside_G0":12.0,
+ "hvg2000_in_G0":1989.0,
+ "hvg8192_in_G0":8180.0,
+ "n_mt_genes":13.0,
+ "control_mito_frac_median":0.1073027636,
+ "control_depth_R":1.1249916553,
+ "control_depth_cv":0.334112227,
+ "nb_genes_with_phi_le_0":399.0
+}

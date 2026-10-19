@@ -1,0 +1,26 @@
+{
+ "check_C_G0_equals_M1_rho_max_abs_diff":4.440892099e-16,
+ "frac_ge_0_5_rho_sb_C_G0":0.3938644236,
+ "frac_ge_0_5_rho_sb_C_HVG2000":0.5160811479,
+ "frac_ge_0_5_rho_sb_C_HVG8192":0.3943592281,
+ "frac_ge_0_5_rho_sb_A_G0":0.3725878278,
+ "frac_ge_0_5_rho_sb_B_G0":0.3572488867,
+ "frac_ge_0_5_rho_sb_NB_G0":0.3424047501,
+ "spearman_rho_A_vs_C":0.9930227746,
+ "depth_R_quantiles":[
+  1.0939,
+  1.139,
+  1.2387
+ ],
+ "depth_cv_median":0.3540014625,
+ "control_depth_R":1.1249916553,
+ "control_depth_cv":0.334112227,
+ "phi_median":0.0476658895,
+ "phi_loo_median":0.0473320647,
+ "breadth_pr_median":696.1988960723,
+ "mito_AmB_quantiles":[
+  -1953.21,
+  -4.13,
+  2319.81
+ ]
+}

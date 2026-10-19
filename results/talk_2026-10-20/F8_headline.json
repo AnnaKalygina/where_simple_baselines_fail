@@ -1,0 +1,40 @@
+{
+ "n_cells": 111445,
+ "n_controls": 11855,
+ "n_G0": 9616,
+ "n_pairs_NA": 131,
+ "NA_quantiles": [
+  0.05,
+  0.074,
+  0.124,
+  0.303,
+  0.536
+ ],
+ "identity_max_rel_diff": 1.590240167985496e-14,
+ "n_error_rows": 524,
+ "n_pairs_with_NA_in_errors": 131,
+ "PRESAGE": {
+  "n": 131,
+  "median_direction_share": 0.8822351121836103,
+  "spearman_NA_vs_direction_error": 0.004121069769924731,
+  "spearman_NA_vs_scale_error": 0.5867559920995036
+ },
+ "GEARS": {
+  "n": 131,
+  "median_direction_share": 0.9087549210685091,
+  "spearman_NA_vs_direction_error": -0.14530582146417403,
+  "spearman_NA_vs_scale_error": 0.48481066244247495
+ },
+ "scGPT": {
+  "n": 131,
+  "median_direction_share": 0.9498230316721266,
+  "spearman_NA_vs_direction_error": -0.21748079877112136,
+  "spearman_NA_vs_scale_error": 0.08688172043010753
+ },
+ "Additive": {
+  "n": 131,
+  "median_direction_share": 0.8323927751104294,
+  "spearman_NA_vs_direction_error": -0.060219932739016706,
+  "spearman_NA_vs_scale_error": 0.7117439812096301
+ }
+}
